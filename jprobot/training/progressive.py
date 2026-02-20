@@ -43,53 +43,22 @@ DEFAULT_STAGES = [1_000_000, 5_000_000, 10_000_000, 50_000_000, 100_000_000]
 # ── Curriculum definitions ───────────────────────────────────────────────────
 # Each curriculum is a sequence of stages with env_config overrides.
 # "target" is cumulative steps *within the curriculum* (not global).
-
-_STAND_ENV_CONFIG = {
-    "fac_movement": 0.0,
-    "fac_height_bonus": 60.0,
-    "fac_orientation": 5.0,
-    "fac_arm_contact": 2.0,
-    "penalty_factor": 1.0,
-}
-
-_WALK_ENV_CONFIG = {
-    "fac_movement": 1000.0,
-    "fac_height_bonus": 40.0,
-    "fac_orientation": 5.0,
-    "fac_arm_contact": 2.0,
-    "penalty_factor": 1.0,
-}
+#
+# v5 — Bug-fixed, back to original opencat-gym simplicity.
+# All 5 critical bugs fixed in env.py:
+#   1. Smoothness uses normalized+squared (was raw degrees+abs → 100x too large)
+#   2. arm_link_indices = {1,2,4,5} (was {0,1,4,5} — 0 is battery)
+#   3. Termination threshold = 74.5° (was 50°)
+#   4. arm_contact = cumulative count * 0.01 (was binary 2.0/step)
+#   5. PENALTY_STEPS = 2M (was 100M)
 
 CURRICULA = {
-    "walk": {
-        "name": "walk",
-        "description": "Crawl→Stand→Walk curriculum from stage_50M baseline",
-        "start_model": "trained/snapshots/stage_50M.zip",
+    "simple": {
+        "name": "simple",
+        "description": "Original opencat-gym design: 2M steps produces stable walking",
+        "start_model": None,
         "stages": [
-            {
-                "name": "Stand-10M",
-                "target": 10_000_000,
-                "ent_coef": 0.005,
-                "env_config": _STAND_ENV_CONFIG,
-            },
-            {
-                "name": "Stand-30M",
-                "target": 30_000_000,
-                "ent_coef": 0.005,
-                "env_config": _STAND_ENV_CONFIG,
-            },
-            {
-                "name": "Walk-40M",
-                "target": 40_000_000,
-                "ent_coef": 0.0,
-                "env_config": _WALK_ENV_CONFIG,
-            },
-            {
-                "name": "Walk-90M",
-                "target": 90_000_000,
-                "ent_coef": 0.0,
-                "env_config": _WALK_ENV_CONFIG,
-            },
+            {"name": "Learn-2M", "target": 2_000_000, "ent_coef": 0.0, "env_config": {}},
         ],
     },
 }
@@ -323,19 +292,20 @@ class ProgressiveTrainer:
         """
         cur_name = curriculum["name"]
         stages = curriculum["stages"]
-        start_model = curriculum["start_model"]
+        start_model = curriculum.get("start_model")
 
-        # Resolve start_model path relative to project root
-        start_model_abs = os.path.join(self.trained_dir, "..", start_model)
-        start_model_abs = os.path.abspath(start_model_abs)
-        if not os.path.exists(start_model_abs):
-            # Try as absolute or relative to cwd
-            if os.path.exists(start_model):
-                start_model_abs = os.path.abspath(start_model)
-            else:
-                print(f"[Curriculum] ERROR: Start model not found: {start_model}")
-                print(f"  Tried: {start_model_abs}")
-                return
+        # Resolve start_model path (None = train from scratch)
+        start_model_abs = None
+        if start_model is not None:
+            start_model_abs = os.path.join(self.trained_dir, "..", start_model)
+            start_model_abs = os.path.abspath(start_model_abs)
+            if not os.path.exists(start_model_abs):
+                if os.path.exists(start_model):
+                    start_model_abs = os.path.abspath(start_model)
+                else:
+                    print(f"[Curriculum] ERROR: Start model not found: {start_model}")
+                    print(f"  Tried: {start_model_abs}")
+                    return
 
         state = self._load_state()
 
@@ -350,7 +320,7 @@ class ProgressiveTrainer:
                 "stage_idx": 0,
                 "total_stages": len(stages),
                 "total_steps": 0,
-                "best_model": start_model_abs,
+                "best_model": start_model_abs,  # None = from scratch
                 "last_metrics": None,
                 "stages": [],
                 "curriculum": cur_name,
@@ -358,8 +328,15 @@ class ProgressiveTrainer:
                 "started_at": datetime.now().isoformat(timespec="seconds"),
             }
             self._save_state(state)
+            # Clear stale posture metrics from previous training
+            for fname in ("posture_eval.json", "posture_eval_history.jsonl"):
+                fpath = os.path.join(self.trained_dir, fname)
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+                    print(f"[Curriculum] Cleared stale {fname}")
             print(f"[Curriculum] Starting '{cur_name}' with {len(stages)} stages")
-            print(f"  Base model: {start_model_abs}")
+            src = start_model_abs if start_model_abs else "scratch (random init)"
+            print(f"  Base model: {src}")
 
         os.makedirs(self.snapshot_dir, exist_ok=True)
 

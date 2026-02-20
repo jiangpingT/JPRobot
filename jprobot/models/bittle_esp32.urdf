@@ -118,7 +118,7 @@
         <origin xyz="0.055 0.05 0"/>
         <parent link="torso"/>
         <child link="left_upper_arm"/>
-        <limit effort="0.2" lower="-1.57" upper="1.57" velocity="31.4"/>
+        <limit effort="0" lower="-1.57" upper="1.57" velocity="0"/>
     </joint>
 
     <joint name="elbow_left" type="revolute">
@@ -126,7 +126,7 @@
         <origin xyz="0 -0.015 -0.045" rpy="0 -1.57 0"/>
         <parent link="left_upper_arm"/>
         <child link="left_lower_arm"/>
-        <limit effort="0.2" lower="-1.57" upper="1.57" velocity="31.4"/>
+        <limit effort="0" lower="-1.57" upper="1.57" velocity="0"/>
     </joint>
 
     <joint name="paw_front_left" type="fixed">
@@ -196,7 +196,7 @@
         <origin xyz="0.055 -0.05 0"/>
         <parent link="torso"/>
         <child link="right_upper_arm"/>
-        <limit effort="0.2" lower="-1.57" upper="1.57" velocity="31.4"/>
+        <limit effort="0" lower="-1.57" upper="1.57" velocity="0"/>
     </joint>
 
     <joint name="elbow_right" type="revolute">
@@ -204,7 +204,7 @@
         <origin xyz="0 0.015 -0.045" rpy="0 -1.57 0"/>
         <parent link="right_upper_arm"/>
         <child link="right_lower_arm"/>
-        <limit effort="0.2" lower="-1.57" upper="1.57" velocity="31.4"/>
+        <limit effort="0" lower="-1.57" upper="1.57" velocity="0"/>
     </joint>
 
     <joint name="paw_front_right" type="fixed">
@@ -274,7 +274,7 @@
         <origin xyz="-0.055 -0.05 0"/>
         <parent link="torso"/>
         <child link="right_upper_leg"/>
-        <limit effort="0.2" lower="-1.57" upper="2.0" velocity="31.4"/>
+        <limit effort="0" lower="-1.57" upper="2.00" velocity="0"/>
     </joint>
 
     <joint name="knee_right" type="revolute">
@@ -282,7 +282,7 @@
         <origin xyz="0 0.015 -0.045" rpy="0 -1.57 0"/>
         <parent link="right_upper_leg"/>
         <child link="right_lower_leg"/>
-        <limit effort="0.2" lower="-1.57" upper="1.57" velocity="31.4"/>
+        <limit effort="0" lower="-1.57" upper="1.57" velocity="0"/>
     </joint>
 
     <joint name="paw_back_right" type="fixed">
@@ -352,7 +352,7 @@
         <origin xyz="-0.055 0.05 0"/>
         <parent link="torso"/>
         <child link="left_upper_leg"/>
-        <limit effort="0.2" lower="-1.57" upper="2.0" velocity="31.4"/>
+        <limit effort="0" lower="-1.57" upper="2.00" velocity="0"/>
     </joint>
 
     <joint name="knee_left" type="revolute">
@@ -360,7 +360,7 @@
         <origin xyz="0 -0.015 -0.045" rpy="0 -1.57 0"/>
         <parent link="left_upper_leg"/>
         <child link="left_lower_leg"/>
-        <limit effort="0.2" lower="-1.57" upper="1.57" velocity="31.4"/>
+        <limit effort="0" lower="-1.57" upper="1.57" velocity="0"/>
     </joint>
 
     <joint name="paw_back_left" type="fixed">
