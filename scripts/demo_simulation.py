@@ -43,7 +43,7 @@ def main():
     )
     robot_id = p.loadURDF(
         urdf_path,
-        [0, 0, 0.1],
+        [0, 0, 0.08],
         p.getQuaternionFromEuler([0, 0, 0]),
         flags=p.URDF_USE_SELF_COLLISION,
     )
@@ -57,13 +57,17 @@ def main():
         joint_type = ["revolute", "prismatic", "spherical", "planar", "fixed"][info[2]]
         print(f"  [{i}] {joint_name} ({joint_type})")
 
-    # Initialize to standing pose
-    init_angle = math.radians(50)
+    # Initialize to standing pose (matching training: shoulders/hips=50°, elbows/knees=0°)
+    init_pattern = [1, 0, 1, 0, 1, 0, 1, 0]  # alternating: upper=50°, lower=0°
     revolute_joints = []
+    joint_idx = 0
     for i in range(n_joints):
         if p.getJointInfo(robot_id, i)[2] == 0:  # revolute
             revolute_joints.append(i)
-            p.resetJointState(robot_id, i, init_angle)
+            angle = math.radians(init_pattern[joint_idx] * 50)
+            p.resetJointState(robot_id, i, angle)
+            p.changeDynamics(robot_id, i, maxJointVelocity=math.pi * 10)
+            joint_idx += 1
 
     print(f"\nActuated joints: {revolute_joints}")
     print("\nRunning simple walking demo...")
@@ -87,7 +91,6 @@ def main():
                     p.POSITION_CONTROL,
                     targetPosition=angle,
                     force=0.2,
-                    maxVelocity=10 * math.pi,
                 )
 
             p.stepSimulation()
