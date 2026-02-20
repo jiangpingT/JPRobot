@@ -126,10 +126,12 @@ class SnapshotCallback(BaseCallback):
             manifest.json                  ← history log
     """
 
-    def __init__(self, snapshot_dir: str, min_improvement: float = 5.0, verbose: int = 1):
+    def __init__(self, snapshot_dir: str, min_improvement: float = 5.0,
+                 reset_best: bool = False, verbose: int = 1):
         super().__init__(verbose)
         self.snapshot_dir = snapshot_dir
         self.min_improvement = min_improvement
+        self.reset_best = reset_best
         self.best_reward = -float("inf")
         self.manifest_path = os.path.join(snapshot_dir, "manifest.json")
         self.manifest: list[dict] = []
@@ -139,9 +141,11 @@ class SnapshotCallback(BaseCallback):
         if os.path.exists(self.manifest_path):
             with open(self.manifest_path) as f:
                 self.manifest = json.load(f)
-            if self.manifest:
+            if self.manifest and not self.reset_best:
                 self.best_reward = max(e["reward"] for e in self.manifest)
                 print(f"[Snapshot] Restored best reward from manifest: {self.best_reward:.0f}")
+            elif self.reset_best:
+                print(f"[Snapshot] reset_best=True, starting from -inf (curriculum stage change)")
 
     def _on_step(self) -> bool:
         return True
@@ -190,11 +194,16 @@ def train(
     resume_from: str = None,
     seed: int = 42,
     return_metrics: bool = False,
+    env_config: dict = None,
+    ent_coef: float = 0.0,
 ):
     """Train a PPO agent for BittleX locomotion.
 
     Args:
         return_metrics: If True, returns (model, metrics_dict) instead of model.
+        env_config: Override reward weights for curriculum stages (passed to BittleGymEnv).
+        ent_coef: Entropy coefficient for PPO (0.0 = pure policy gradient,
+                  >0 encourages exploration).
     """
     if net_arch is None:
         net_arch = [256, 256]
@@ -211,21 +220,30 @@ def train(
     print(f"  Timesteps:     {total_timesteps:,}")
     print(f"  Parallel envs: {parallel_envs}")
     print(f"  Network arch:  {net_arch}")
+    print(f"  ent_coef:      {ent_coef}")
+    if env_config:
+        print(f"  env_config:    {env_config}")
     print(f"  Snapshots:     {snapshot_dir}  (best model + named on improvement)")
     print(f"  Checkpoints:   {checkpoint_dir}  (every 2M steps)")
     print()
 
+    # Build env_kwargs for vectorised environments
+    env_kwargs = {"config": env_config} if env_config else {}
+
     # Check environment (skip when resuming — env hasn't changed)
     if not resume_from:
         print("Checking environment...")
-        env = BittleGymEnv()
+        env = BittleGymEnv(**env_kwargs)
         check_env(env)
         env.close()
         print("Environment check passed.")
 
     # Vectorised environments
     print(f"Creating {parallel_envs} parallel environments...")
-    vec_env = make_vec_env(BittleGymEnv, n_envs=parallel_envs, vec_env_cls=SubprocVecEnv)
+    vec_env = make_vec_env(
+        BittleGymEnv, n_envs=parallel_envs, vec_env_cls=SubprocVecEnv,
+        env_kwargs=env_kwargs or None,
+    )
 
     # PPO setup
     custom_arch = dict(net_arch=net_arch)
@@ -240,7 +258,7 @@ def train(
             n_steps=n_steps,
             learning_rate=linear_schedule(3e-4),
             target_kl=0.05,
-            ent_coef=0.0,
+            ent_coef=ent_coef,
             verbose=1,
         )
     else:
@@ -252,12 +270,15 @@ def train(
             n_steps=n_steps,
             learning_rate=linear_schedule(3e-4),
             target_kl=0.05,
-            ent_coef=0.0,
+            ent_coef=ent_coef,
             verbose=1,
         )
 
     # Callbacks
-    snapshot_cb = SnapshotCallback(snapshot_dir=snapshot_dir, min_improvement=5.0)
+    snapshot_cb = SnapshotCallback(
+        snapshot_dir=snapshot_dir, min_improvement=5.0,
+        reset_best=(env_config is not None),
+    )
     checkpoint_cb = CheckpointCallback(
         save_freq=max(2_000_000 // parallel_envs, 1),
         save_path=checkpoint_dir,
@@ -271,7 +292,7 @@ def train(
     print(f"Starting training for {total_timesteps:,} steps...")
     print(f"  learning_rate: linear_schedule(3e-4 → 0)")
     print(f"  target_kl:     0.05")
-    print(f"  ent_coef:      0.0")
+    print(f"  ent_coef:      {ent_coef}")
     model.learn(
         total_timesteps=total_timesteps,
         callback=callbacks,

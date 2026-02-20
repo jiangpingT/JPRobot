@@ -6,6 +6,8 @@
 #   ./scripts/train.sh --resume     # 从上次断点续训
 #   ./scripts/train.sh --auto       # 自动通过所有阶段（无需手动确认）
 #   ./scripts/train.sh --resume --auto
+#   ./scripts/train.sh --curriculum walk --auto          # 课程学习：站立→走路
+#   ./scripts/train.sh --curriculum walk --resume --auto # 课程学习续训
 
 set -e
 cd "$(dirname "$0")/.."

@@ -52,7 +52,7 @@ FAC_CLEARANCE = 0.0
 FAC_SLIP = 0.0
 FAC_ARM_CONTACT = 2.0       # Arm/elbow ground contact
 FAC_ORIENTATION = 5.0       # Body tilt penalty (abs roll + abs pitch)
-FAC_HEIGHT = 100.0          # Below-minimum-height penalty
+FAC_HEIGHT_BONUS = 40.0     # Per-step bonus for body height above MIN_HEIGHT
 MIN_HEIGHT = 0.045          # Minimum acceptable body height (m)
 PENALTY_STEPS = 100_000_000  # Per-env steps where penalty reaches full strength
 
@@ -300,6 +300,9 @@ class BittleGymEnv(gym.Env):
 
         Key design: forward movement is only rewarded when the robot is upright.
         This prevents the "rolling exploit" where tumbling forward earns reward.
+
+        All reward weights are read from self.config with fallback to module-level
+        defaults, so curriculum stages can override any weight without code changes.
         """
         position = np.array(position)
 
@@ -308,40 +311,47 @@ class BittleGymEnv(gym.Env):
         posture_factor = max(0.0, 1.0 - tilt / 0.6)
 
         # === Survival reward (per step, always positive, encourages staying alive) ===
-        reward = FAC_SURVIVAL
+        reward = self.config.get("fac_survival", FAC_SURVIVAL)
 
         # === Forward reward (gated by posture) ===
+        fac_movement = self.config.get("fac_movement", FAC_MOVEMENT)
         movement_forward = position[0] - self.prev_position[0]
-        reward += FAC_MOVEMENT * movement_forward * posture_factor
+        reward += fac_movement * movement_forward * posture_factor
 
-        # === Progressive penalty factor ===
-        penalty_factor = min(1.0, self.step_counter_session / PENALTY_STEPS)
+        # === Height bonus (always active, encourages standing tall) ===
+        fac_height_bonus = self.config.get("fac_height_bonus", FAC_HEIGHT_BONUS)
+        reward += fac_height_bonus * position[2]
+
+        # === Penalty factor: support hard override from config ===
+        pf_override = self.config.get("penalty_factor", None)
+        if pf_override is not None:
+            penalty_factor = pf_override
+        else:
+            penalty_factor = min(1.0, self.step_counter_session / PENALTY_STEPS)
 
         # Smoothness penalty (1st order: angle velocity)
         angle_diff = self.joint_angles - self.prev_joint_angles
-        smooth_1 = FAC_SMOOTH_1 * np.sum(np.abs(angle_diff)) / self.n_joints
+        smooth_1 = self.config.get("fac_smooth_1", FAC_SMOOTH_1) * np.sum(np.abs(angle_diff)) / self.n_joints
 
         # Smoothness penalty (2nd order: angle acceleration)
         angle_accel = (self.joint_angles - 2 * self.prev_joint_angles
                        + self.prev_prev_joint_angles)
-        smooth_2 = FAC_SMOOTH_2 * np.sum(np.abs(angle_accel)) / self.n_joints
+        smooth_2 = self.config.get("fac_smooth_2", FAC_SMOOTH_2) * np.sum(np.abs(angle_accel)) / self.n_joints
 
         smooth_penalty = smooth_1 + smooth_2
 
         # Body stability penalty (angular velocity)
         ang_vel = velocity[1]
-        stability_penalty = FAC_STABILITY * (abs(ang_vel[0]) + abs(ang_vel[1]))
+        stability_penalty = self.config.get("fac_stability", FAC_STABILITY) * (abs(ang_vel[0]) + abs(ang_vel[1]))
 
         # Z-velocity penalty
-        z_vel_penalty = FAC_Z_VELOCITY * abs(velocity[0][2])
+        z_vel_penalty = self.config.get("fac_z_velocity", FAC_Z_VELOCITY) * abs(velocity[0][2])
 
         # Orientation penalty (absolute tilt angle)
-        orientation_penalty = FAC_ORIENTATION * tilt
-
-        # Height penalty (only when below minimum — prevents belly-crawling)
-        height_penalty = FAC_HEIGHT * max(0, MIN_HEIGHT - position[2])
+        orientation_penalty = self.config.get("fac_orientation", FAC_ORIENTATION) * tilt
 
         # Arm contact penalty (check if arm/elbow links touch ground)
+        fac_arm_contact = self.config.get("fac_arm_contact", FAC_ARM_CONTACT)
         arm_contact_penalty = 0.0
         contact_points = p.getContactPoints(
             self.robot_id, physicsClientId=self.physics_client
@@ -350,14 +360,14 @@ class BittleGymEnv(gym.Env):
         self._last_arm_contact = False
         for contact in contact_points:
             if contact[3] in arm_link_indices or contact[4] in arm_link_indices:
-                arm_contact_penalty = FAC_ARM_CONTACT
+                arm_contact_penalty = fac_arm_contact
                 self._last_arm_contact = True
                 break
 
         # Apply progressive penalty
         total_penalty = penalty_factor * (
             smooth_penalty + stability_penalty + z_vel_penalty
-            + orientation_penalty + height_penalty + arm_contact_penalty
+            + orientation_penalty + arm_contact_penalty
         )
 
         reward -= total_penalty
