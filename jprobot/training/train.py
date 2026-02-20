@@ -62,6 +62,52 @@ class MetricsTracker(BaseCallback):
         }
 
 
+class PostureMetricsCallback(BaseCallback):
+    """Tracks per-episode posture metrics (height, arm contact, tilt) from env info.
+
+    Writes a rolling summary to trained/posture_eval.json after every rollout,
+    so the dashboard can show whether the robot is walking or crawling.
+    """
+
+    def __init__(self, output_path: str, window: int = 100):
+        super().__init__(verbose=0)
+        self.output_path = output_path
+        self.window = window
+        self._heights: list[float] = []
+        self._arm_contacts: list[float] = []
+        self._tilts: list[float] = []
+
+    def _on_step(self) -> bool:
+        for info in self.locals.get('infos', []):
+            posture = info.get('posture')
+            if posture:
+                self._heights.append(posture['avg_height'])
+                self._arm_contacts.append(posture['arm_contact_rate'])
+                self._tilts.append(posture['avg_tilt_deg'])
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if not self._heights:
+            return
+        w = self.window
+        avg_h = float(np.mean(self._heights[-w:]))
+        avg_ac = float(np.mean(self._arm_contacts[-w:]))
+        avg_tilt = float(np.mean(self._tilts[-w:]))
+        # Simple heuristic: walking = high body + low arm contact
+        behavior = 'walking' if avg_h > 0.06 and avg_ac < 0.3 else 'crawling'
+        data = {
+            'avg_height': round(avg_h, 4),
+            'arm_contact_rate': round(avg_ac, 3),
+            'avg_tilt_deg': round(avg_tilt, 1),
+            'behavior': behavior,
+            'episodes_sampled': len(self._heights),
+            'updated_at': datetime.now().isoformat(timespec='seconds'),
+        }
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        with open(self.output_path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+
 def linear_schedule(initial_value: float):
     """Linear learning rate schedule: initial_value -> 0."""
     def func(progress_remaining: float) -> float:
@@ -159,6 +205,7 @@ def train(
 
     snapshot_dir = os.path.join(trained_dir, "snapshots")
     checkpoint_dir = os.path.join(trained_dir, "checkpoints")
+    posture_eval_path = os.path.join(trained_dir, "posture_eval.json")
 
     print("[JPRobot Training]")
     print(f"  Timesteps:     {total_timesteps:,}")
@@ -217,7 +264,8 @@ def train(
         name_prefix="bittle_ppo",
     )
     metrics_cb = MetricsTracker()
-    callbacks = CallbackList([snapshot_cb, checkpoint_cb, metrics_cb])
+    posture_cb = PostureMetricsCallback(output_path=posture_eval_path)
+    callbacks = CallbackList([snapshot_cb, checkpoint_cb, metrics_cb, posture_cb])
 
     # Train
     print(f"Starting training for {total_timesteps:,} steps...")

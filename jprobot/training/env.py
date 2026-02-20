@@ -109,6 +109,12 @@ class BittleGymEnv(gym.Env):
         self.prev_prev_joint_angles = np.zeros(self.n_joints)
         self.prev_position = np.zeros(3)
 
+        # Posture tracking per episode (written to info at episode end for dashboard)
+        self._ep_heights: list[float] = []
+        self._ep_arm_contacts: list[bool] = []
+        self._ep_tilts: list[float] = []
+        self._last_arm_contact: bool = False
+
         # URDF model path
         self.urdf_path = os.path.join(
             os.path.dirname(__file__), "..", "models", "bittle_esp32.urdf"
@@ -171,6 +177,9 @@ class BittleGymEnv(gym.Env):
                                             physicsClientId=self.physics_client)[0]
         )
         self.step_counter = 0
+        self._ep_heights.clear()
+        self._ep_arm_contacts.clear()
+        self._ep_tilts.clear()
 
         return self._get_observation(), {}
 
@@ -232,6 +241,11 @@ class BittleGymEnv(gym.Env):
         # Calculate reward
         reward = self._calculate_reward(position, euler, velocity)
 
+        # Track posture metrics (uses _last_arm_contact set by _calculate_reward)
+        self._ep_heights.append(position[2])
+        self._ep_tilts.append(abs(euler[0]) + abs(euler[1]))
+        self._ep_arm_contacts.append(self._last_arm_contact)
+
         # Check termination (50° tilt threshold, was 40°/0.7 rad)
         terminated = abs(euler[0]) > 0.873 or abs(euler[1]) > 0.873
         truncated = self.step_counter >= self.episode_length
@@ -241,7 +255,15 @@ class BittleGymEnv(gym.Env):
 
         self.prev_position = np.array(position)
 
-        return self._get_observation(orientation, velocity), float(reward), terminated, truncated, {}
+        info = {}
+        if (terminated or truncated) and self._ep_heights:
+            info['posture'] = {
+                'avg_height': float(np.mean(self._ep_heights)),
+                'arm_contact_rate': float(np.mean(self._ep_arm_contacts)),
+                'avg_tilt_deg': float(np.degrees(np.mean(self._ep_tilts))),
+            }
+
+        return self._get_observation(orientation, velocity), float(reward), terminated, truncated, info
 
     def _get_observation(self, orientation=None, velocity=None):
         """Build observation vector (246 dimensions).
@@ -325,9 +347,11 @@ class BittleGymEnv(gym.Env):
             self.robot_id, physicsClientId=self.physics_client
         )
         arm_link_indices = {0, 1, 4, 5}  # Upper/lower arm links
+        self._last_arm_contact = False
         for contact in contact_points:
             if contact[3] in arm_link_indices or contact[4] in arm_link_indices:
                 arm_contact_penalty = FAC_ARM_CONTACT
+                self._last_arm_contact = True
                 break
 
         # Apply progressive penalty

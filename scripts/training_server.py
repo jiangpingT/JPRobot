@@ -21,11 +21,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # Default log file (current training)
 DEFAULT_LOG = "/private/tmp/claude-501/-Users-mlamp-Workspace-JPClaw/tasks/b4e9ff9.output"
 PROGRESSIVE_STATE = os.path.join(os.path.dirname(__file__), "..", "trained", "progressive_state.json")
+POSTURE_EVAL = os.path.join(os.path.dirname(__file__), "..", "trained", "posture_eval.json")
 
 
 def parse_progressive_state():
     """Read progressive training state if available."""
     path = os.path.abspath(PROGRESSIVE_STATE)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def parse_posture_eval():
+    """Read posture evaluation metrics if available."""
+    path = os.path.abspath(POSTURE_EVAL)
     if not os.path.exists(path):
         return None
     with open(path) as f:
@@ -122,6 +132,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="summary" id="summary">加载中...</div>
 
 <div class="stats" id="stats"></div>
+
+<h2 class="section-title" id="postureTitle" style="display:none;">行为分析（机器狗是在走路还是在爬行？）</h2>
+<div class="health" id="posture" style="margin-bottom:20px;"></div>
 
 <h2 class="section-title" id="stageHistoryTitle" style="display:none;">已完成阶段</h2>
 <div id="stageHistory" style="margin-bottom:20px;display:flex;flex-wrap:wrap;gap:8px;"></div>
@@ -297,6 +310,45 @@ function fetchData() {
         healthCard('explained_variance', '预测准确度（价值网络预测奖励的准确性）', (ev * 100).toFixed(1) + '%', evHint, evColor) +
         '';
 
+      // Render posture analysis
+      const postureEl = document.getElementById('posture');
+      const postureTitle = document.getElementById('postureTitle');
+      const posture = d.posture;
+      if (postureEl && posture) {
+        postureTitle.style.display = '';
+        const isWalking = posture.behavior === 'walking';
+        const behaviorColor = isWalking ? 'h-good' : 'h-warn';
+        const behaviorText = isWalking ? '走路' : '爬行';
+        const behaviorHint = isWalking ? '身体高度正常，手臂未撑地' : '身体低伏，手臂频繁触地';
+
+        const h = posture.avg_height;
+        const heightColor = h > 0.06 ? 'h-good' : h > 0.04 ? 'h-warn' : 'h-bad';
+        const heightHint = h > 0.06 ? '站立高度正常（参考：站立≈0.07m）'
+                         : h > 0.04 ? '偏低，介于爬行与站立之间'
+                         : '爬行高度（身体贴地）';
+
+        const ac = posture.arm_contact_rate * 100;
+        const acColor = ac < 20 ? 'h-good' : ac < 50 ? 'h-warn' : 'h-bad';
+        const acHint = ac < 20 ? '手臂几乎不触地，走路姿态'
+                     : ac < 50 ? '手臂偶尔触地，姿态欠佳'
+                     : '手臂频繁撑地，典型爬行';
+
+        const tilt = posture.avg_tilt_deg;
+        const tiltColor = tilt < 10 ? 'h-good' : tilt < 20 ? 'h-warn' : 'h-bad';
+        const tiltHint = tilt < 10 ? '姿态端正' : tilt < 20 ? '轻微前倾' : '明显前倾/侧倾';
+
+        const ep = posture.episodes_sampled || 0;
+        const updatedAt = posture.updated_at ? posture.updated_at.replace('T', ' ') : '';
+
+        postureEl.innerHTML =
+          healthCard('行为判断', '基于身体高度和手臂触地率综合判断', behaviorText, behaviorHint + '（样本 ' + ep + ' 局，更新 ' + updatedAt + '）', behaviorColor) +
+          healthCard('平均身体高度', '站立≈0.07m / 爬行≈0.03m', h.toFixed(4) + 'm', heightHint, heightColor) +
+          healthCard('手臂触地频率', '手臂/肘关节接触地面的步数占比', ac.toFixed(1) + '%', acHint, acColor) +
+          healthCard('平均姿态倾角', '机体 roll+pitch 综合倾斜角', tilt.toFixed(1) + '°', tiltHint, tiltColor);
+      } else if (postureTitle) {
+        postureTitle.style.display = 'none';
+      }
+
       // Render completed stage history
       const histEl = document.getElementById('stageHistory');
       const histTitle = document.getElementById('stageHistoryTitle');
@@ -350,11 +402,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/data":
             metrics = parse_training_log(self.log_file)
             stage = parse_progressive_state()
+            posture = parse_posture_eval()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps({"metrics": metrics, "stage": stage}).encode("utf-8"))
+            self.wfile.write(json.dumps({"metrics": metrics, "stage": stage, "posture": posture}).encode("utf-8"))
 
         else:
             self.send_response(404)
