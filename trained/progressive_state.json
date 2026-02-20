@@ -1,0 +1,75 @@
+{
+  "stage_idx": 3,
+  "total_stages": 5,
+  "total_steps": 10000000,
+  "best_model": "/Users/mlamp/Workspace/JPRobot/trained/snapshots/best.zip",
+  "last_metrics": {
+    "reward_final": 61.51219592,
+    "reward_best": 61.51219592,
+    "reward_start": 16.15208064934426,
+    "reward_end": 55.2118761309836,
+    "reward_trend": 39.05979548163934,
+    "ep_len_final": 63.96
+  },
+  "stages": [
+    {
+      "name": "1M",
+      "target_steps": 1000000,
+      "stage_steps": 1000000,
+      "snapshot": "/Users/mlamp/Workspace/JPRobot/trained/snapshots/stage_1M.zip",
+      "metrics": {
+        "reward_final": 21.49898183,
+        "reward_best": 32.67259738,
+        "reward_start": 3.889432661666667,
+        "reward_end": 22.5917792475,
+        "reward_trend": 18.702346585833332,
+        "ep_len_final": 105.05
+      },
+      "healthy": true,
+      "issues": [],
+      "completed_at": "2026-02-19T20:47:27"
+    },
+    {
+      "name": "5M",
+      "target_steps": 5000000,
+      "stage_steps": 4000000,
+      "snapshot": "/Users/mlamp/Workspace/JPRobot/trained/snapshots/stage_5M.zip",
+      "metrics": {
+        "reward_final": 52.4176804,
+        "reward_best": 76.38024777999999,
+        "reward_start": 15.85777984612245,
+        "reward_end": 58.359881968163265,
+        "reward_trend": 42.50210212204082,
+        "ep_len_final": 63.66
+      },
+      "healthy": true,
+      "issues": [],
+      "completed_at": "2026-02-19T21:10:05"
+    },
+    {
+      "name": "10M",
+      "target_steps": 10000000,
+      "stage_steps": 5000000,
+      "snapshot": "/Users/mlamp/Workspace/JPRobot/trained/snapshots/stage_10M.zip",
+      "metrics": {
+        "reward_final": 61.51219592,
+        "reward_best": 61.51219592,
+        "reward_start": 16.15208064934426,
+        "reward_end": 55.2118761309836,
+        "reward_trend": 39.05979548163934,
+        "ep_len_final": 63.96
+      },
+      "healthy": true,
+      "issues": [],
+      "completed_at": "2026-02-19T21:35:43"
+    }
+  ],
+  "started_at": "2026-02-19T20:38:02",
+  "planned_stages": [
+    1000000,
+    5000000,
+    10000000,
+    50000000,
+    100000000
+  ]
+}

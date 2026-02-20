@@ -1,0 +1,39 @@
+# JPRobot Configuration
+
+robot:
+  model: "BittleX"
+  dof: 16
+  baud_rate: 115200
+  # Serial port auto-detect, or specify manually:
+  # port: "/dev/tty.usbserial-xxxxx"
+
+agent:
+  # vibe.deepminer.ai available models:
+  #   claude-sonnet-4-6    - Default, best Function Calling
+  #   claude-haiku-4-5-20251001   - Fastest, cheapest
+  #   claude-opus-4-6             - Strongest reasoning
+  #   gemini-3-pro-image-preview  - Multimodal/image
+  #   gpt-5                       - OpenAI flagship
+  model: "claude-sonnet-4-6"
+  temperature: 0.7
+  max_history: 20
+  system_prompt: |
+    你是 JPRobot，一个智能机器狗助手。你可以控制一个 Petoi BittleX 四足机器人。
+    你需要理解用户的自然语言指令，并调用合适的工具来控制机器人执行动作。
+    回复时请简洁友好，像一只聪明的小狗一样。
+
+training:
+  algorithm: "PPO"
+  total_timesteps: 2_000_000
+  parallel_envs: 8
+  net_arch: [256, 256]
+  episode_length: 250
+  gui_mode: false
+
+  reward:
+    fac_movement: 1000.0
+    fac_smooth_1: 1.0
+    fac_smooth_2: 1.0
+    fac_stability: 0.1
+    fac_arm_contact: 0.01
+    penalty_steps: 2_000_000
