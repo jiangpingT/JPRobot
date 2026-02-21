@@ -518,10 +518,13 @@ function fetchData() {
       if (isCurriculum && curPlan) {
         const curIdx = stage.curriculum_stage_idx || 0;
         totalStages = curPlan.length;
-        stageNum = curIdx + 1;
+        stageNum = Math.min(curIdx + 1, totalStages);
         globalTotalSteps = curPlan[curPlan.length - 1].target;
-        globalDoneSteps = curIdx > 0 ? curPlan[curIdx - 1].target : 0;
-        if (curIdx < curPlan.length) {
+        if (curIdx >= totalStages) {
+          // All stages done: lock at 100%, don't double-count
+          globalDoneSteps = globalTotalSteps;
+        } else {
+          globalDoneSteps = curIdx > 0 ? curPlan[curIdx - 1].target : 0;
           const curStageDef = curPlan[curIdx];
           const prevTarget = curIdx > 0 ? curPlan[curIdx - 1].target : 0;
           stageTargetSteps = curStageDef.target - prevTarget;
@@ -551,7 +554,7 @@ function fetchData() {
       const stageTypeCn = curStageCn(currentStageName);
 
       // Overall progress (across all stages)
-      const globalCurrent = globalDoneSteps + total;
+      const globalCurrent = Math.min(globalDoneSteps + total, globalTotalSteps);
       const globalPct = globalTotalSteps > 0 ? (globalCurrent / globalTotalSteps * 100).toFixed(0) : 100;
       const globalEta = fps > 0 && globalTotalSteps > globalCurrent
         ? ((globalTotalSteps - globalCurrent) / fps / 3600).toFixed(1) : '?';
@@ -1333,7 +1336,7 @@ fetch('/api/viz/snapshots')
       const opt = document.createElement('option');
       opt.value = name;
       opt.textContent = name === '__latest__' ? '\u25cf \u5b9e\u65f6 (\u6700\u65b0\u68c0\u67e5\u70b9)'
-        : name === '__timelapse__' ? '\u23f3 \u8fc7\u7a0b\u56de\u653e (\u524d\u671f\u2192\u4e2d\u671f\u2192\u6700\u7ec8)'
+        : name === '__timelapse__' ? '\u23f3 \u8fc7\u7a0b\u56de\u653e (\u524d\u671f\u00d73\u2192\u4e2d\u671f\u2192\u6700\u7ec8)'
         : name;
       sel.appendChild(opt);
     });
@@ -1421,15 +1424,37 @@ def _pick_timelapse_models(trained_dir):
             nearby = sorted(candidates, key=lambda c: abs(c["step"] - target_m))[:3]
         return max(nearby, key=lambda c: c["rew"])
 
-    # Early: ~5% of training, Mid: ~50%, Late: best
-    early = pick_near(max_step * 0.05) if max_step > 0.3 else candidates[0]
-    mid = pick_near(max_step * 0.5)
+    def pick_first_at(target_m):
+        """Pick the first snapshot at or after target_m steps."""
+        after = [c for c in candidates if c["step"] >= target_m]
+        if after:
+            return after[0]  # candidates already sorted by step, take earliest
+        # fallback: closest one
+        return min(candidates, key=lambda c: abs(c["step"] - target_m))
+
+    # 前期: first snapshot at ~0.1M, ~0.2M, ~0.3M
+    early_batch = [pick_first_at(0.1), pick_first_at(0.2), pick_first_at(0.3)]
+    # 中期: first snapshot with reward in 500-600 range; fallback to ~60%
+    mid_candidates = [c for c in candidates if 500 <= c["rew"] <= 600]
+    mid = mid_candidates[0] if mid_candidates else pick_near(max_step * 0.6)
+    # 最终: best reward snapshot
     late = max(candidates, key=lambda c: c["rew"])
 
     # Deduplicate
     result = []
     seen = set()
-    for label, c in [("前期", early), ("中期", mid), ("最终", late)]:
+
+    # Add 前期 1/2/3
+    for idx, c in enumerate(early_batch):
+        if c["file"] not in seen:
+            result.append({
+                "name": f"前期{idx + 1}/3 ({c['step']:.1f}M步, 奖励{c['rew']})",
+                "file": c["file"],
+            })
+            seen.add(c["file"])
+
+    # Add 中期 and 最终
+    for label, c in [("中期", mid), ("最终", late)]:
         if c["file"] not in seen:
             result.append({
                 "name": f"{label} ({c['step']:.1f}M步, 奖励{c['rew']})",

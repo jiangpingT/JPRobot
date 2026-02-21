@@ -94,7 +94,7 @@ class SkillRegistry:
             ("pd",   "Play Dead",      "装死",       "Play dead (fall over)"),
             ("pee",  "Pee",            "撒尿",       "Lift leg to pee"),
             ("pu",   "Push Up",        "俯卧撑",     "Do push ups"),
-            ("pu1",  "Push Up v2",     "俯卧撑2",    "Push up variation"),
+            ("pu1",  "Push Up Single Arm", "单臂俯卧撑", "Push up with a single arm"),
             ("rc",   "Recover",        "恢复",       "Recover from fallen state"),
             ("rl",   "Roll",           "翻滚",       "Roll over"),
             ("scrh", "Scratch",        "抓痒",       "Scratch self"),
