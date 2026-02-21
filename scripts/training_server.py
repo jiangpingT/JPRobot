@@ -255,7 +255,7 @@ class EvalEngine:
 
                     # Joint angles in action-space order (matches plan mapping)
                     joints = []
-                    for ji in env.joint_indices:
+                    for ji in env.joint_id:
                         js = p.getJointState(env.robot_id, ji, physicsClientId=env.physics_client)
                         joints.append(round(js[0], 4))
 
@@ -558,29 +558,46 @@ function fetchData() {
       // Current stage progress
       const stagePct = stageTargetSteps > 0 ? (total / stageTargetSteps * 100).toFixed(0) : 100;
 
-      const healthy = curReward > rewards[0] && curReward > 0;
+      // Health check: use last 20% of rewards to detect real decline vs penalty growth
+      const tail5 = rewards.slice(-Math.max(1, Math.floor(rewards.length/5)));
+      const head5 = rewards.slice(0, Math.max(1, Math.floor(rewards.length/5)));
+      const tailAvg = tail5.reduce((a,b) => a+b, 0) / tail5.length;
+      const headAvg = head5.reduce((a,b) => a+b, 0) / head5.length;
+      // Reward decline is normal after ~1.5M steps due to penalty_factor growth
+      // Only warn if decline happens early (before 50% of training)
+      const earlyDecline = (globalCurrent / globalTotalSteps < 0.5) && tailAvg < headAvg - 50;
+      const healthy = !earlyDecline && curLen > 50;
       const isDone = globalCurrent >= globalTotalSteps;
 
-      // Status badge: show overall progress
-      const stageTag = stageTypeCn ? stageTypeCn + ' ' + stageNum + '/' + totalStages : stageNum + '/' + totalStages;
+      // Status badge
+      const stageTag = totalStages > 1
+        ? (stageTypeCn ? stageTypeCn + ' ' + stageNum + '/' + totalStages : stageNum + '/' + totalStages)
+        : (stageTypeCn || '');
       document.getElementById('statusBadge').className = 'status ' + (isDone ? 'done' : 'running');
-      document.getElementById('statusBadge').textContent = isDone ? '已完成' : ('训练中 ' + stageTag + ' 整体' + globalPct + '%');
+      document.getElementById('statusBadge').textContent = isDone
+        ? '已完成 · 奖励 ' + bestReward.toFixed(0)
+        : ('训练中 ' + (stageTag ? stageTag + ' ' : '') + globalPct + '%');
 
       // Summary text
-      const stageDesc = isCurriculum
+      const stageDesc = isCurriculum && totalStages > 1
         ? '<b style="color:#c084fc;">' + stageTypeCn + '（' + currentStageName + '）</b>，第 ' + stageNum + '/' + totalStages + ' 阶段，'
         : (totalStages > 1 ? '<b style="color:#c084fc;">第 ' + stageNum + '/' + totalStages + ' 阶段</b>，' : '');
+      const etaText = isDone ? '' : '预计剩余 <b>' + globalEta + '</b> 小时。';
+      const healthText = isDone
+        ? (curLen > 200
+          ? ' <b style="color:#4ade80;">训练完成！机器人已学会行走。</b>'
+          : ' <b style="color:#facc15;">训练完成，但存活步数偏低，可能需要额外训练。</b>')
+        : (healthy
+          ? ' <b style="color:#4ade80;">训练健康。</b>'
+          : ' <b style="color:#f87171;">早期奖励下降，可能需要检查。</b>');
       document.getElementById('summary').innerHTML =
         '<b style="color:#38bdf8;">训练总结：</b>' + stageDesc +
-        '整体进度 <b style="color:#38bdf8;">' + (globalCurrent/1e6).toFixed(1) + 'M</b> / ' + (globalTotalSteps/1e6).toFixed(0) + 'M 步（' + globalPct + '%），' +
-        '本阶段 ' + (total/1e6).toFixed(1) + 'M / ' + (stageTargetSteps/1e6).toFixed(0) + 'M（' + stagePct + '%），' +
-        '预计总剩余 <b>' + globalEta + '</b> 小时。' +
-        '当前每轮奖励 <b style="color:#4ade80;">' + curReward.toFixed(0) + '</b>，' +
+        '进度 <b style="color:#38bdf8;">' + (globalCurrent/1e6).toFixed(1) + 'M</b> / ' + (globalTotalSteps/1e6).toFixed(0) + 'M 步（' + globalPct + '%）。' +
+        etaText +
+        '当前奖励 <b style="color:#4ade80;">' + curReward.toFixed(0) + '</b>，' +
         '历史最高 <b style="color:#facc15;">' + bestReward.toFixed(0) + '</b>。' +
-        '每轮存活 <b style="color:#c084fc;">' + curLen.toFixed(0) + '</b>/250 步。' +
-        (healthy
-          ? ' <b style="color:#4ade80;">训练健康，奖励持续增长。</b>'
-          : ' <b style="color:#f87171;">注意：奖励出现下降，可能需要检查。</b>');
+        '存活 <b style="color:#c084fc;">' + curLen.toFixed(0) + '</b>/250 步。' +
+        healthText;
 
       document.getElementById('stats').innerHTML =
         '<div class="stat"><div class="label">整体进度</div><div class="value blue">' + (globalCurrent/1e6).toFixed(1) + 'M / ' + (globalTotalSteps/1e6).toFixed(0) + 'M</div></div>' +
@@ -661,8 +678,11 @@ function fetchData() {
 
         // Title
         const curDesc = d.curricula[curName] ? d.curricula[curName].description : curName;
+        const stageProgress = curTotal > 1
+          ? '已完成 ' + curIdx + '/' + curTotal + ' 个阶段'
+          : (curIdx >= curTotal ? '已完成' : '训练中');
         let html = '<div style="font-size:14px;color:#c084fc;font-weight:600;margin-bottom:10px;">' +
-          '课程学习：' + curName + ' · 已完成 ' + curIdx + '/' + curTotal + ' 个阶段' +
+          '课程：' + curName + ' · ' + stageProgress +
           '<span style="font-size:11px;color:#64748b;margin-left:8px;">(' + curDesc + ')</span></div>';
 
         // Stage pipeline
@@ -1203,6 +1223,24 @@ function connectSSE() {
     const d = JSON.parse(e.data);
     document.getElementById('sReward').textContent = d.total_reward.toFixed(0) + (d.survived ? ' ✓' : ' ✗');
     document.getElementById('sDistance').textContent = d.max_distance.toFixed(3) + 'm';
+    // Timelapse: advance to next model after episode ends
+    if (timelapseQueue.length > 0) {
+      timelapseIdx++;
+      if (timelapseIdx < timelapseQueue.length) {
+        const next = timelapseQueue[timelapseIdx];
+        document.getElementById('sModel').textContent = '\u23f3 ' + next.name;
+        setTimeout(() => {
+          fetch('/api/viz/control', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'start', model: next.file }),
+          });
+        }, 1000);
+      } else {
+        timelapseQueue = [];
+        document.getElementById('sModel').textContent = '\u2705 过程回放完成';
+      }
+    }
   });
 
   evtSource.addEventListener('model_updated', e => {
@@ -1226,10 +1264,33 @@ function updateBtn(running) {
   }
 }
 
+let timelapseQueue = [];
+let timelapseIdx = 0;
+
 window.doControl = function(action) {
+  const sel = document.getElementById('modelSelect');
+  const model = sel.value;
+
+  if (action === 'start' && model === '__timelapse__') {
+    // Timelapse mode: fetch model list, then play sequentially
+    fetch('/api/viz/timelapse').then(r => r.json()).then(models => {
+      if (!models.length) { alert('没有可用的过程快照'); return; }
+      timelapseQueue = models;
+      timelapseIdx = 0;
+      document.getElementById('sModel').textContent = '\u23f3 ' + models[0].name;
+      fetch('/api/viz/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'start', model: models[0].file }),
+      });
+    });
+    return;
+  }
+
   const body = { action };
   if (action === 'start') {
-    body.model = document.getElementById('modelSelect').value;
+    timelapseQueue = [];
+    body.model = model;
   }
   fetch('/api/viz/control', {
     method: 'POST',
@@ -1237,6 +1298,30 @@ window.doControl = function(action) {
     body: JSON.stringify(body),
   });
 };
+
+// Auto-advance timelapse when episode ends (step reaches 250+)
+let lastTimelapseStep = 0;
+function checkTimelapseAdvance(step) {
+  if (timelapseQueue.length === 0) return;
+  if (step < lastTimelapseStep && lastTimelapseStep > 200) {
+    // Episode just reset → advance to next model
+    timelapseIdx++;
+    if (timelapseIdx < timelapseQueue.length) {
+      const next = timelapseQueue[timelapseIdx];
+      document.getElementById('sModel').textContent = '\u23f3 ' + next.name;
+      fetch('/api/viz/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'start', model: next.file }),
+      });
+    } else {
+      // All done
+      timelapseQueue = [];
+      document.getElementById('sModel').textContent = '\u2705 过程回放完成';
+    }
+  }
+  lastTimelapseStep = step;
+}
 
 // Load snapshot list
 fetch('/api/viz/snapshots')
@@ -1247,7 +1332,9 @@ fetch('/api/viz/snapshots')
     list.forEach(name => {
       const opt = document.createElement('option');
       opt.value = name;
-      opt.textContent = name === '__latest__' ? '\u25cf \u5b9e\u65f6 (\u6700\u65b0\u68c0\u67e5\u70b9)' : name;
+      opt.textContent = name === '__latest__' ? '\u25cf \u5b9e\u65f6 (\u6700\u65b0\u68c0\u67e5\u70b9)'
+        : name === '__timelapse__' ? '\u23f3 \u8fc7\u7a0b\u56de\u653e (\u524d\u671f\u2192\u4e2d\u671f\u2192\u6700\u7ec8)'
+        : name;
       sel.appendChild(opt);
     });
   });
@@ -1283,6 +1370,9 @@ def _list_snapshots(trained_dir):
     if os.path.exists(os.path.join(snap_dir, "best.zip")):
         snapshots.append("best.zip")
 
+    # Timelapse option (auto-picks early / mid / late snapshots)
+    snapshots.append("__timelapse__")
+
     # stage snapshots
     if os.path.isdir(snap_dir):
         for f in sorted(os.listdir(snap_dir)):
@@ -1296,6 +1386,58 @@ def _list_snapshots(trained_dir):
                 snapshots.append(f)
 
     return snapshots
+
+
+def _pick_timelapse_models(trained_dir):
+    """Pick 3 representative models: early (~0.1M), mid (~1M), final (best).
+
+    Returns list of {"name": display_name, "file": filename} dicts.
+    """
+    import re
+    snap_dir = os.path.join(trained_dir, "snapshots")
+    if not os.path.isdir(snap_dir):
+        return []
+
+    # Parse step_X.XM_rew_Y.zip files with positive reward
+    candidates = []
+    for f in os.listdir(snap_dir):
+        m = re.match(r"step_([\d.]+)M_rew_(-?\d+)\.zip", f)
+        if m:
+            step_m = float(m.group(1))
+            rew = int(m.group(2))
+            if rew > 0:
+                candidates.append({"file": f, "step": step_m, "rew": rew})
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda x: x["step"])
+    max_step = max(c["step"] for c in candidates)
+
+    def pick_near(target_m):
+        """Pick the snapshot with highest reward near target step."""
+        nearby = [c for c in candidates if abs(c["step"] - target_m) <= max(0.2, target_m * 0.3)]
+        if not nearby:
+            nearby = sorted(candidates, key=lambda c: abs(c["step"] - target_m))[:3]
+        return max(nearby, key=lambda c: c["rew"])
+
+    # Early: ~5% of training, Mid: ~50%, Late: best
+    early = pick_near(max_step * 0.05) if max_step > 0.3 else candidates[0]
+    mid = pick_near(max_step * 0.5)
+    late = max(candidates, key=lambda c: c["rew"])
+
+    # Deduplicate
+    result = []
+    seen = set()
+    for label, c in [("前期", early), ("中期", mid), ("最终", late)]:
+        if c["file"] not in seen:
+            result.append({
+                "name": f"{label} ({c['step']:.1f}M步, 奖励{c['rew']})",
+                "file": c["file"],
+            })
+            seen.add(c["file"])
+
+    return result
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -1338,6 +1480,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(snapshots).encode("utf-8"))
+
+        elif self.path == "/api/viz/timelapse":
+            models = _pick_timelapse_models(self.trained_dir)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(models).encode("utf-8"))
 
         elif self.path == "/api/viz/stream":
             self._handle_sse()
