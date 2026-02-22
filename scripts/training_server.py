@@ -1581,8 +1581,8 @@ const FOX_JOINT_MAP = [
 ];
 
 let foxMode = false;
-let foxBones = {};
-let foxRestAngles = {};
+let foxMixer = null;   // AnimationMixer for Fox built-in walk animation
+let foxWalkAction = null;
 
 // foxWrapper: receives PyBullet position/quaternion (same coordinate system as robotGroup)
 const foxWrapper = new THREE.Group();
@@ -1603,21 +1603,17 @@ foxLoader.load('/assets/Fox.glb', (gltf) => {
 
   foxWrapper.add(foxModel);
 
-  // Collect all Bone nodes from the skeleton
-  gltf.scene.traverse(obj => {
-    if (obj.isBone) foxBones[obj.name] = obj;
-  });
-  console.log('Fox GLB loaded. Bones found:', Object.keys(foxBones));
-
-  // Save rest pose rotations so we apply joint angles as deltas
-  FOX_JOINT_MAP.forEach(jm => {
-    const b = foxBones[jm.bone];
-    if (b) {
-      foxRestAngles[jm.bone] = { x: b.rotation.x, y: b.rotation.y, z: b.rotation.z };
-    } else {
-      console.warn('Fox bone not found in skeleton:', jm.bone);
-    }
-  });
+  // Use Fox's built-in Walk animation driven by robot speed
+  if (gltf.animations && gltf.animations.length > 0) {
+    foxMixer = new THREE.AnimationMixer(foxModel);
+    const walkClip = THREE.AnimationClip.findByName(gltf.animations, 'Walk')
+                  || gltf.animations[0];
+    foxWalkAction = foxMixer.clipAction(walkClip);
+    foxWalkAction.play();
+    foxWalkAction.timeScale = 0;  // start paused; speed set by robot velocity
+    console.log('Fox animations:', gltf.animations.map(a => a.name));
+  }
+  console.log('Fox GLB loaded with AnimationMixer.');
 }, undefined, (err) => {
   console.error('Failed to load Fox.glb:', err);
 });
@@ -1761,15 +1757,10 @@ function connectSSE() {
       }
     });
 
-    // Update Fox skeleton bones (Route B)
-    if (foxMode && Object.keys(foxBones).length > 0) {
-      d.joints.forEach((angle, i) => {
-        const jm = FOX_JOINT_MAP[i];
-        if (jm && foxBones[jm.bone]) {
-          const rest = foxRestAngles[jm.bone] || { x: 0, y: 0, z: 0 };
-          foxBones[jm.bone].rotation[jm.axis] = rest[jm.axis] + angle * jm.scale;
-        }
-      });
+    // Drive Fox Walk animation speed by robot velocity
+    // Robot crawl ~0.1-0.3 m/s → timeScale ~0.5-1.5 looks natural
+    if (foxMode && foxWalkAction) {
+      foxWalkAction.timeScale = Math.min(2.5, Math.max(0, Math.abs(speed) * 5));
     }
 
     // Distance & speed
@@ -1913,8 +1904,11 @@ fetch('/api/viz/snapshots')
   });
 
 // ─── Render loop ────────────────────────────────────────────
+const clock = new THREE.Clock();
 function animate() {
   requestAnimationFrame(animate);
+  const delta = clock.getDelta();
+  if (foxMixer) foxMixer.update(delta);
   controls.update();
   renderer.render(scene, camera);
 }
