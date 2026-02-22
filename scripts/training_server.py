@@ -1497,6 +1497,75 @@ const jointMap = [
   { pivot: legs.BL.elbowPivot,    prop: 'y' },  // 7: knee_left
 ];
 
+// ─── Simple Robot Group（原始简化版，无猫造型）──────────────────
+// 用 MeshLambertMaterial 纯色几何体，和最早版本一致
+const smBodyMat  = new THREE.MeshLambertMaterial({ color: 0x4488cc });
+const smLegMat   = new THREE.MeshLambertMaterial({ color: 0x5599dd });
+const smLowerMat = new THREE.MeshLambertMaterial({ color: 0x2255aa });
+const smPawMat   = new THREE.MeshLambertMaterial({ color: 0x88bbee });
+
+const simpleGroup = new THREE.Group();
+simpleGroup.visible = false;
+scene.add(simpleGroup);
+
+// 躯干
+simpleGroup.add((() => {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(...TORSO_SIZE), smBodyMat);
+  m.castShadow = true; return m;
+})());
+// 电池块
+simpleGroup.add((() => {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.038, 0.012), smBodyMat);
+  m.position.set(0, 0, -0.016); m.castShadow = true; return m;
+})());
+
+// 四条腿（和猫完全相同的 URDF 尺寸，但无装饰）
+const smLegs = {};
+legConfig.forEach(cfg => {
+  const shoulderPivot = new THREE.Group();
+  shoulderPivot.position.set(cfg.ox, cfg.oy, 0);
+  simpleGroup.add(shoulderPivot);
+
+  const upper = new THREE.Mesh(
+    new THREE.CylinderGeometry(UPPER_R * 1.2, UPPER_R * 1.2, UPPER_L, 8), smLegMat);
+  upper.rotation.x = Math.PI / 2;
+  upper.position.set(0, 0, -UPPER_L / 2);
+  upper.castShadow = true;
+  shoulderPivot.add(upper);
+
+  const elbowStatic = new THREE.Group();
+  elbowStatic.position.set(0, cfg.elbowOy, -UPPER_L);
+  elbowStatic.rotation.y = -Math.PI / 2;
+  shoulderPivot.add(elbowStatic);
+
+  const elbowPivot = new THREE.Group();
+  elbowStatic.add(elbowPivot);
+
+  const lower = new THREE.Mesh(
+    new THREE.CylinderGeometry(LOWER_R, LOWER_R * 1.2, LOWER_L, 8), smLowerMat);
+  lower.rotation.x = Math.PI / 2;
+  lower.position.set(0, 0, -LOWER_L / 2);
+  lower.castShadow = true;
+  elbowPivot.add(lower);
+
+  const paw = new THREE.Mesh(new THREE.SphereGeometry(PAW_R, 7, 5), smPawMat);
+  paw.position.set(0, 0, -LOWER_L - PAW_R * 0.7);
+  elbowPivot.add(paw);
+
+  smLegs[cfg.name] = { shoulderPivot, elbowPivot };
+});
+
+const simpleJointMap = [
+  { pivot: smLegs.FL.shoulderPivot, prop: 'y' },
+  { pivot: smLegs.FL.elbowPivot,    prop: 'y' },
+  { pivot: smLegs.FR.shoulderPivot, prop: 'y' },
+  { pivot: smLegs.FR.elbowPivot,    prop: 'y' },
+  { pivot: smLegs.BR.shoulderPivot, prop: 'y' },
+  { pivot: smLegs.BR.elbowPivot,    prop: 'y' },
+  { pivot: smLegs.BL.shoulderPivot, prop: 'y' },
+  { pivot: smLegs.BL.elbowPivot,    prop: 'y' },
+];
+
 // ─── Fox GLB Model (Route B) ────────────────────────────────
 // Bone mapping: BittleX joint index → Fox skeleton bone name + rotation axis
 // Left side joints use axis 'x' scale +1; Right side use scale -1 (mirrored)
@@ -1529,9 +1598,8 @@ foxLoader.load('/assets/Fox.glb', (gltf) => {
   foxModel.rotation.x = -Math.PI / 2;
   foxModel.rotation.z = Math.PI;
 
-  // Scale: Fox model is ~200 glTF units tall.
-  // BittleX torso = 0.11m → fox scaled to similar size (~0.12m body length).
-  foxModel.scale.set(0.00065, 0.00065, 0.00065);
+  // Scale: ~0.0013 makes Fox visually similar in size to the toon cat.
+  foxModel.scale.set(0.0013, 0.0013, 0.0013);
 
   foxWrapper.add(foxModel);
 
@@ -1574,6 +1642,7 @@ window.toggleSimpleMode = function() {
   if (simpleMode) {
     robotGroup.visible = false;
     foxWrapper.visible = false;
+    simpleGroup.visible = true;
     btn.textContent = '⬛ 退出简化';
     btn.style.background = '#64748b';
     foxBtn.style.opacity = '0.35';
@@ -1581,6 +1650,7 @@ window.toggleSimpleMode = function() {
   } else {
     robotGroup.visible = !foxMode;
     foxWrapper.visible = foxMode;
+    simpleGroup.visible = false;
     btn.textContent = '⬛ 简化';
     btn.style.background = '#334155';
     foxBtn.style.opacity = '1';
@@ -1680,6 +1750,15 @@ function connectSSE() {
     d.joints.forEach((angle, i) => {
       if (jointMap[i]) {
         jointMap[i].pivot.rotation[jointMap[i].prop] = angle;
+      }
+    });
+
+    // Update simple robot
+    simpleGroup.position.set(px, py, pz);
+    simpleGroup.quaternion.set(qx, qy, qz, qw);
+    d.joints.forEach((angle, i) => {
+      if (simpleJointMap[i]) {
+        simpleJointMap[i].pivot.rotation[simpleJointMap[i].prop] = angle;
       }
     });
 
