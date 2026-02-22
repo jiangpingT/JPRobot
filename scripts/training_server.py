@@ -1187,6 +1187,7 @@ VISUALIZATION_HTML = r"""<!DOCTYPE html>
   <select id="modelSelect"><option value="best.zip">best.zip</option></select>
   <button id="startBtn" onclick="doControl('start')">开始</button>
   <button id="foxBtn" onclick="toggleFoxMode()" style="background:#0f766e;border-color:#0f766e;margin-top:4px;font-size:12px;">🦊 Fox 模型</button>
+  <button id="simpleBtn" onclick="toggleSimpleMode()" style="background:#334155;border-color:#475569;margin-top:4px;font-size:12px;">⬛ 简化</button>
 </div>
 
 <div id="connStatus">未连接</div>
@@ -1214,8 +1215,8 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x1a1a2e);
-scene.fog = new THREE.Fog(0x1a1a2e, 2, 6);
+scene.background = new THREE.Color(0x3a4060);
+scene.fog = new THREE.Fog(0x3a4060, 3, 8);
 
 // Z-up camera (match PyBullet)
 const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 20);
@@ -1229,12 +1230,12 @@ controls.dampingFactor = 0.1;
 controls.update();
 
 // ─── Lights ─────────────────────────────────────────────────
-// 环境光（暖色调，模拟室内漫反射）
-const ambientLight = new THREE.AmbientLight(0xfff0e0, 0.7);
+// 环境光（提升整体亮度，让黑色猫体与背景有对比）
+const ambientLight = new THREE.AmbientLight(0xfff0e0, 1.6);
 scene.add(ambientLight);
 
-// 主光源（偏暖白，从右上方照射，产生阴影）
-const dirLight = new THREE.DirectionalLight(0xfffbe8, 1.4);
+// 主光源（加强正面打光，让黑色表面有光泽感）
+const dirLight = new THREE.DirectionalLight(0xfffbe8, 2.2);
 dirLight.position.set(0.8, -1.2, 2.5);
 dirLight.castShadow = true;
 dirLight.shadow.mapSize.set(2048, 2048);
@@ -1243,30 +1244,30 @@ dirLight.shadow.camera.top = 0.5; dirLight.shadow.camera.bottom = -0.5;
 dirLight.shadow.bias = -0.001;
 scene.add(dirLight);
 
-// 轮廓补光（冷蓝色，从左后方，增强立体感）
-const rimLight = new THREE.DirectionalLight(0xaad4ff, 0.5);
+// 轮廓补光（冷蓝色，增强立体感）
+const rimLight = new THREE.DirectionalLight(0xaad4ff, 1.0);
 rimLight.position.set(-1, 1.5, 1);
 scene.add(rimLight);
 
-// 底部反射光（模拟地面反射的暖色）
-const fillLight = new THREE.DirectionalLight(0xffd090, 0.3);
+// 底部反射光（暖色）
+const fillLight = new THREE.DirectionalLight(0xffd090, 0.7);
 fillLight.position.set(0, 0, -1);
 scene.add(fillLight);
 
 // ─── Ground plane ───────────────────────────────────────────
 const groundGeo = new THREE.PlaneGeometry(6, 2);
-const groundMat = new THREE.MeshToonMaterial({ color: 0x1a1a30 });
+const groundMat = new THREE.MeshToonMaterial({ color: 0x2e3358 });
 const ground = new THREE.Mesh(groundGeo, groundMat);
 ground.receiveShadow = true;
 ground.position.set(1.5, 0, -0.001);
 scene.add(ground);
 
-// GridHelper 网格线地板（用 Three.js 内置 GridHelper，旋转到 XY 平面）
-const gridHelper = new THREE.GridHelper(6, 60, 0x3a3aff, 0x2a2a55);
-gridHelper.rotation.x = Math.PI / 2;  // 旋转到 XY 平面（Z-up）
+// GridHelper 网格线地板
+const gridHelper = new THREE.GridHelper(6, 60, 0x6677dd, 0x4455aa);
+gridHelper.rotation.x = Math.PI / 2;
 gridHelper.position.set(1.5, 0, 0.001);
 gridHelper.material.transparent = true;
-gridHelper.material.opacity = 0.45;
+gridHelper.material.opacity = 0.6;
 scene.add(gridHelper);
 
 // ─── Robot model ────────────────────────────────────────────
@@ -1553,7 +1554,10 @@ foxLoader.load('/assets/Fox.glb', (gltf) => {
   console.error('Failed to load Fox.glb:', err);
 });
 
+let simpleMode = false;
+
 window.toggleFoxMode = function() {
+  if (simpleMode) return;  // 简化模式下不切换
   foxMode = !foxMode;
   robotGroup.visible = !foxMode;
   foxWrapper.visible = foxMode;
@@ -1561,6 +1565,27 @@ window.toggleFoxMode = function() {
   btn.textContent = foxMode ? '🐱 卡通猫' : '🦊 Fox 模型';
   btn.style.background = foxMode ? '#e8721a' : '#0f766e';
   btn.style.borderColor = foxMode ? '#c95e10' : '#0f766e';
+};
+
+window.toggleSimpleMode = function() {
+  simpleMode = !simpleMode;
+  const btn = document.getElementById('simpleBtn');
+  const foxBtn = document.getElementById('foxBtn');
+  if (simpleMode) {
+    robotGroup.visible = false;
+    foxWrapper.visible = false;
+    btn.textContent = '⬛ 退出简化';
+    btn.style.background = '#64748b';
+    foxBtn.style.opacity = '0.35';
+    foxBtn.style.pointerEvents = 'none';
+  } else {
+    robotGroup.visible = !foxMode;
+    foxWrapper.visible = foxMode;
+    btn.textContent = '⬛ 简化';
+    btn.style.background = '#334155';
+    foxBtn.style.opacity = '1';
+    foxBtn.style.pointerEvents = 'auto';
+  }
 };
 
 // ─── Trajectory trail ───────────────────────────────────────
@@ -1647,9 +1672,8 @@ function connectSSE() {
     robotGroup.quaternion.set(qx, qy, qz, qw);
 
     // Fox wrapper follows same position/orientation as robot
-    // +0.08 Z offset: robot center during crawling is ~3-5cm above ground;
-    // raising by 8cm keeps Fox visually above the ground plane.
-    foxWrapper.position.set(px, py, pz + 0.08);
+    // +0.04 Z offset: slight lift so Fox doesn't sink into ground.
+    foxWrapper.position.set(px, py, pz + 0.04);
     foxWrapper.quaternion.set(qx, qy, qz, qw);
 
     // Update joint angles (toon cat)
