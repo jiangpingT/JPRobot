@@ -1276,27 +1276,27 @@ const UPPER_R = 0.004, UPPER_L = 0.045;    // 腿略粗一点点显得卡通
 const LOWER_R = 0.003, LOWER_L = 0.05;
 const PAW_R = 0.007, PAW_L = 0.009;        // 爪子略大
 
-// ─── 卡通材质（MeshToonMaterial，橘猫配色）───────────────────
-// 橘猫主色：橘黄色身体
-const matTorso   = new THREE.MeshToonMaterial({ color: 0xe8721a });
-// 白色肚子（胸腹部装饰）
-const matBelly    = new THREE.MeshToonMaterial({ color: 0xf5f0e8 });
-// 前腿：橘色上肢
-const matUpperFront = new THREE.MeshToonMaterial({ color: 0xe8721a });
-// 后腿：深橘上肢
-const matUpperBack  = new THREE.MeshToonMaterial({ color: 0xc95e10 });
-// 下肢：深棕色
-const matLower    = new THREE.MeshToonMaterial({ color: 0x8b4513 });
-// 爪子：米白色
-const matPaw      = new THREE.MeshToonMaterial({ color: 0xf5deb3 });
+// ─── 卡通材质（MeshToonMaterial，黑白猫配色 / 燕尾服猫）───────
+// 身体主色：黑色
+const matTorso   = new THREE.MeshToonMaterial({ color: 0x1c1c1c });
+// 胸腹部：白色
+const matBelly    = new THREE.MeshToonMaterial({ color: 0xf0f0f0 });
+// 前腿：白色（胸部延伸到前腿）
+const matUpperFront = new THREE.MeshToonMaterial({ color: 0xf0f0f0 });
+// 后腿：黑色
+const matUpperBack  = new THREE.MeshToonMaterial({ color: 0x1c1c1c });
+// 下肢：深灰黑色
+const matLower    = new THREE.MeshToonMaterial({ color: 0x2a2a2a });
+// 爪子：白色
+const matPaw      = new THREE.MeshToonMaterial({ color: 0xf5f5f5 });
 // 电池/背部装饰：深灰
-const matBattery  = new THREE.MeshToonMaterial({ color: 0x2a2a2a });
-// 耳朵：橘色外耳
-const matEarOuter = new THREE.MeshToonMaterial({ color: 0xe8721a });
+const matBattery  = new THREE.MeshToonMaterial({ color: 0x111111 });
+// 耳朵：黑色外耳
+const matEarOuter = new THREE.MeshToonMaterial({ color: 0x1c1c1c });
 // 耳朵内：粉色内耳
 const matEarInner = new THREE.MeshToonMaterial({ color: 0xff9eb5 });
-// 尾巴：橘棕渐变用橘色
-const matTail     = new THREE.MeshToonMaterial({ color: 0xc95e10 });
+// 尾巴：黑色
+const matTail     = new THREE.MeshToonMaterial({ color: 0x1c1c1c });
 
 const robotGroup = new THREE.Group();
 scene.add(robotGroup);
@@ -1647,7 +1647,9 @@ function connectSSE() {
     robotGroup.quaternion.set(qx, qy, qz, qw);
 
     // Fox wrapper follows same position/orientation as robot
-    foxWrapper.position.set(px, py, pz);
+    // +0.08 Z offset: robot center during crawling is ~3-5cm above ground;
+    // raising by 8cm keeps Fox visually above the ground plane.
+    foxWrapper.position.set(px, py, pz + 0.08);
     foxWrapper.quaternion.set(qx, qy, qz, qw);
 
     // Update joint angles (toon cat)
