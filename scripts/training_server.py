@@ -17,6 +17,7 @@ import argparse
 import threading
 import queue
 import time
+import zipfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -27,6 +28,20 @@ DEFAULT_LOG = "/tmp/ab_test/jprobot.log"
 PROGRESSIVE_STATE = os.path.join(os.path.dirname(__file__), "..", "trained", "progressive_state.json")
 POSTURE_EVAL = os.path.join(os.path.dirname(__file__), "..", "trained", "posture_eval.json")
 POSTURE_HISTORY = os.path.join(os.path.dirname(__file__), "..", "trained", "posture_eval_history.jsonl")
+LIVE_PROGRESS = os.path.join(os.path.dirname(__file__), "..", "trained", "live_progress.json")
+FIXED_EVAL = os.path.join(os.path.dirname(__file__), "..", "trained", "fixed_direction_eval.json")
+
+
+def parse_fixed_eval():
+    """Read fixed-direction evaluation results if available."""
+    path = os.path.abspath(FIXED_EVAL)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def parse_progressive_state():
@@ -36,6 +51,18 @@ def parse_progressive_state():
         return None
     with open(path) as f:
         return json.load(f)
+
+
+def parse_live_progress():
+    """Read live training progress written by LiveProgressCallback (every rollout)."""
+    path = os.path.abspath(LIVE_PROGRESS)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def parse_posture_eval():
@@ -139,6 +166,7 @@ class EvalEngine:
         self._thread = None
         self.current_model = None
         self.state = "idle"
+        self._last_good_latest = None
 
     def subscribe(self):
         q = queue.Queue(maxsize=100)
@@ -161,19 +189,36 @@ class EvalEngine:
                     pass  # drop frame to prevent memory leak
 
     def start(self, model_name="best.zip"):
-        if self.running:
-            return
-        self.running = True
-        self.current_model = model_name
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
+        old_thread = None
+        with self._lock:
+            # If already running same model, no-op.
+            if self.running and self.current_model == model_name:
+                return
+            # If running another model, request stop and wait outside lock.
+            if self.running and self._thread is not None:
+                self.running = False
+                old_thread = self._thread
+
+        if old_thread and old_thread.is_alive():
+            old_thread.join(timeout=2.0)
+
+        with self._lock:
+            self.running = True
+            self.current_model = model_name
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
 
     def stop(self):
-        self.running = False
+        t = None
+        with self._lock:
+            self.running = False
+            t = self._thread
+        if t and t.is_alive():
+            t.join(timeout=2.0)
 
-    def _find_latest_model(self):
-        """Find the most recently modified .zip across all subdirectories."""
-        best_path, best_mtime = None, 0
+    def _iter_models_by_mtime(self):
+        """Yield .zip model paths sorted by mtime descending."""
+        candidates = []
         for subdir in ("checkpoints", "snapshots", ""):
             d = os.path.join(self.trained_dir, subdir) if subdir else self.trained_dir
             if not os.path.isdir(d):
@@ -182,13 +227,41 @@ class EvalEngine:
                 if not f.endswith(".zip"):
                     continue
                 full = os.path.join(d, f)
-                mt = os.path.getmtime(full)
-                if mt > best_mtime:
-                    best_mtime, best_path = mt, full
-        return best_path
+                try:
+                    mt = os.path.getmtime(full)
+                except OSError:
+                    continue
+                candidates.append((mt, full))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, path in candidates:
+            yield path
+
+    @staticmethod
+    def _is_readable_zip(path):
+        """Return True if path is a complete readable zip file."""
+        try:
+            if not os.path.exists(path) or os.path.getsize(path) <= 0:
+                return False
+            if not zipfile.is_zipfile(path):
+                return False
+            with zipfile.ZipFile(path, "r") as zf:
+                zf.namelist()
+            return True
+        except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+            return False
+
+    def _find_latest_model(self):
+        """Find the most recent *readable* model zip."""
+        for path in self._iter_models_by_mtime():
+            if self._is_readable_zip(path):
+                self._last_good_latest = path
+                return path
+        return self._last_good_latest
 
     def _resolve_model_path(self, model_name):
         if model_name == "__latest__":
+            # Real-time mode should follow the newest checkpoint/snapshot.
+            # Skip files that are still being written and keep last good model.
             return self._find_latest_model()
         # Try snapshots/ first, then checkpoints/, then direct path
         for subdir in ("snapshots", "checkpoints", ""):
@@ -233,9 +306,11 @@ class EvalEngine:
                 obs, _ = env.reset()
                 total_reward = 0.0
                 max_distance = 0.0
-                start_x = None
+                start_xy = None
+                target_dir = getattr(env, "target_dir_xy", None)
+                target_name = getattr(env, "target_name", "?")
 
-                self._broadcast("episode_start", {"episode": episode})
+                self._broadcast("episode_start", {"episode": episode, "direction": target_name})
 
                 step = 0
                 terminated = False
@@ -248,9 +323,15 @@ class EvalEngine:
                     pos, orn = p.getBasePositionAndOrientation(
                         env.robot_id, physicsClientId=env.physics_client
                     )
-                    if start_x is None:
-                        start_x = pos[0]
-                    distance = pos[0] - start_x
+                    if start_xy is None:
+                        start_xy = (pos[0], pos[1])
+                    # 沿目标方向的真实位移（多方向训练时比单轴 X 更准确）
+                    delta = (pos[0] - start_xy[0], pos[1] - start_xy[1])
+                    if target_dir is not None:
+                        import numpy as _np
+                        distance = float(_np.dot(delta, target_dir))
+                    else:
+                        distance = delta[0]
                     max_distance = max(max_distance, distance)
 
                     # Joint angles in action-space order (matches plan mapping)
@@ -302,8 +383,9 @@ class EvalEngine:
                                 "file": self.current_model,
                                 "mtime": cur_mtime,
                             })
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._broadcast("status", {"state": "error", "message": str(e)})
+                    break
 
         finally:
             try:
@@ -383,6 +465,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="stats" id="stats"></div>
 
 <div id="curriculumInfo" style="display:none;background:#1e293b;border-radius:10px;padding:14px 18px;margin-bottom:20px;border-left:3px solid #c084fc;">
+</div>
+
+<div id="fixedEvalPanel" style="display:none;background:#1e293b;border-radius:10px;padding:14px 18px;margin-bottom:20px;border-left:3px solid #38bdf8;">
 </div>
 
 <h2 class="section-title" id="postureTitle" style="display:none;">行为分析（机器狗是在走路还是在爬行？）</h2>
@@ -512,8 +597,11 @@ function fetchData() {
       let stageNum = 1, totalStages = 1, stageTargetSteps = 50e6, currentStageName = '';
       let globalTotalSteps = 50e6, globalDoneSteps = 0;
       const isCurriculum = stage && stage.curriculum;
-      const curPlan = isCurriculum && d.curricula && d.curricula[stage.curriculum]
-        ? d.curricula[stage.curriculum].stages : null;
+      const curPlan = isCurriculum
+        ? (d.curricula && d.curricula[stage.curriculum]
+            ? d.curricula[stage.curriculum].stages
+            : (stage.curriculum_stages || null))
+        : null;
 
       if (isCurriculum && curPlan) {
         const curIdx = stage.curriculum_stage_idx || 0;
@@ -554,12 +642,31 @@ function fetchData() {
       const stageTypeCn = curStageCn(currentStageName);
 
       // Overall progress (across all stages)
-      const globalCurrent = Math.min(globalDoneSteps + total, globalTotalSteps);
+      // For curriculum runs, prefer persisted progressive_state total_steps
+      // to avoid stale log timesteps falsely showing 100% done.
+      // If total_steps is 0 (written only at stage completion), fall back to
+      // live_progress.total_timesteps written every rollout by LiveProgressCallback.
+      const lp = d.live_progress;
+      const liveSteps = lp && lp.total_timesteps ? lp.total_timesteps : 0;
+      const stageLocalSteps = Math.min(total, Math.max(0, stageTargetSteps));
+      let globalCurrent = Math.min(globalDoneSteps + stageLocalSteps, globalTotalSteps);
+      if (isCurriculum && stage && typeof stage.total_steps === 'number') {
+        const persistedSteps = stage.total_steps || 0;
+        // Use live_progress when persisted value is 0 (training in progress, not yet written)
+        const effectiveSteps = persistedSteps > 0 ? persistedSteps
+          : (liveSteps > 0 ? globalDoneSteps + liveSteps : globalCurrent);
+        globalCurrent = Math.min(Math.max(0, effectiveSteps), globalTotalSteps);
+      }
       const globalPct = globalTotalSteps > 0 ? (globalCurrent / globalTotalSteps * 100).toFixed(0) : 100;
       const globalEta = fps > 0 && globalTotalSteps > globalCurrent
         ? ((globalTotalSteps - globalCurrent) / fps / 3600).toFixed(1) : '?';
       // Current stage progress
-      const stagePct = stageTargetSteps > 0 ? (total / stageTargetSteps * 100).toFixed(0) : 100;
+      const stageLocalCurrent = isCurriculum && stage && typeof stage.total_steps === 'number'
+        ? Math.max(0, (stage.total_steps > 0 ? stage.total_steps : liveSteps > 0 ? liveSteps : total) - globalDoneSteps)
+        : total;
+      const stagePct = stageTargetSteps > 0
+        ? (Math.min(stageLocalCurrent, stageTargetSteps) / stageTargetSteps * 100).toFixed(0)
+        : 100;
 
       // Health check: use last 20% of rewards to detect real decline vs penalty growth
       const tail5 = rewards.slice(-Math.max(1, Math.floor(rewards.length/5)));
@@ -570,26 +677,72 @@ function fetchData() {
       // Only warn if decline happens early (before 50% of training)
       const earlyDecline = (globalCurrent / globalTotalSteps < 0.5) && tailAvg < headAvg - 50;
       const healthy = !earlyDecline && curLen > 50;
-      const isDone = globalCurrent >= globalTotalSteps;
+      const isDone = isCurriculum
+        ? ((stage.curriculum_stage_idx || 0) >= totalStages)
+        : (globalCurrent >= globalTotalSteps);
 
+      // Prefer curriculum/progressive stage metrics for headline stats.
+      // This avoids mixing legacy log history with the current run summary.
+      // During training (stage.last_metrics is empty), fall back to live_progress.ep_rew_mean.
+      let displayCurReward = curReward;
+      let displayBestReward = bestReward;
+      let displayLen = curLen;
+      if (stage && stage.last_metrics) {
+        if (stage.last_metrics.reward_final !== undefined) {
+          displayCurReward = stage.last_metrics.reward_final;
+        }
+        if (stage.last_metrics.reward_best !== undefined) {
+          displayBestReward = stage.last_metrics.reward_best;
+        }
+        if (stage.last_metrics.ep_len_final !== undefined) {
+          displayLen = stage.last_metrics.ep_len_final;
+        }
+      }
+      // If stage metrics not yet available (training in progress) and live_progress exists, use it
+      if (lp && lp.ep_rew_mean !== null && lp.ep_rew_mean !== undefined) {
+        if (!stage || !stage.last_metrics || stage.last_metrics.reward_final === undefined) {
+          displayCurReward = lp.ep_rew_mean;
+        }
+      }
+
+      function cleanText(v) {
+        if (v === undefined || v === null) return '';
+        const s = String(v).trim();
+        if (!s || s === '()' || s === '[]' || s.toLowerCase() === 'none' || s.toLowerCase() === 'null') {
+          return '';
+        }
+        return s;
+      }
+      const curriculumName = isCurriculum && stage ? cleanText(stage.curriculum || '') : '';
       // Status badge
       const stageTag = totalStages > 1
         ? (stageTypeCn ? stageTypeCn + ' ' + stageNum + '/' + totalStages : stageNum + '/' + totalStages)
         : (stageTypeCn || '');
       document.getElementById('statusBadge').className = 'status ' + (isDone ? 'done' : 'running');
       document.getElementById('statusBadge').textContent = isDone
-        ? '已完成 · 奖励 ' + bestReward.toFixed(0)
+        ? ('已完成' + (curriculumName ? ' · ' + curriculumName : '') + ' · 奖励 ' + displayBestReward.toFixed(0))
         : ('训练中 ' + (stageTag ? stageTag + ' ' : '') + globalPct + '%');
 
       // Summary text
-      const stageDesc = isCurriculum && totalStages > 1
-        ? '<b style="color:#c084fc;">' + stageTypeCn + '（' + currentStageName + '）</b>，第 ' + stageNum + '/' + totalStages + ' 阶段，'
-        : (totalStages > 1 ? '<b style="color:#c084fc;">第 ' + stageNum + '/' + totalStages + ' 阶段</b>，' : '');
+      let stageDesc = '';
+      if (isCurriculum && totalStages > 1) {
+        const currentStageClean = cleanText(currentStageName);
+        if (stageTypeCn || currentStageClean) {
+          const stageLabel = stageTypeCn || currentStageClean;
+          stageDesc = '<b style="color:#c084fc;">' + stageLabel + '</b>，第 ' + stageNum + '/' + totalStages + ' 阶段，';
+        } else if (curriculumName) {
+          stageDesc = '<b style="color:#c084fc;">课程 ' + curriculumName + '</b>，第 ' + stageNum + '/' + totalStages + ' 阶段，';
+        } else {
+          stageDesc = '<b style="color:#c084fc;">第 ' + stageNum + '/' + totalStages + ' 阶段</b>，';
+        }
+      } else if (totalStages > 1) {
+        stageDesc = '<b style="color:#c084fc;">第 ' + stageNum + '/' + totalStages + ' 阶段</b>，';
+      }
       const etaText = isDone ? '' : '预计剩余 <b>' + globalEta + '</b> 小时。';
       const healthText = isDone
         ? (curLen > 200
-          ? ' <b style="color:#4ade80;">训练完成！机器人已学会行走。</b>'
-          : ' <b style="color:#facc15;">训练完成，但存活步数偏低，可能需要额外训练。</b>')
+          ? ' <b style="color:#4ade80;">训练已结束，可进行验收评估。</b>'
+          : ' <b style="color:#facc15;">训练已结束，但稳定性偏弱，建议继续调参或续训。</b>')
         : (healthy
           ? ' <b style="color:#4ade80;">训练健康。</b>'
           : ' <b style="color:#f87171;">早期奖励下降，可能需要检查。</b>');
@@ -597,16 +750,16 @@ function fetchData() {
         '<b style="color:#38bdf8;">训练总结：</b>' + stageDesc +
         '进度 <b style="color:#38bdf8;">' + (globalCurrent/1e6).toFixed(1) + 'M</b> / ' + (globalTotalSteps/1e6).toFixed(0) + 'M 步（' + globalPct + '%）。' +
         etaText +
-        '当前奖励 <b style="color:#4ade80;">' + curReward.toFixed(0) + '</b>，' +
-        '历史最高 <b style="color:#facc15;">' + bestReward.toFixed(0) + '</b>。' +
-        '存活 <b style="color:#c084fc;">' + curLen.toFixed(0) + '</b>/250 步。' +
+        '当前奖励 <b style="color:#4ade80;">' + displayCurReward.toFixed(0) + '</b>，' +
+        '历史最高 <b style="color:#facc15;">' + displayBestReward.toFixed(0) + '</b>。' +
+        '存活 <b style="color:#c084fc;">' + displayLen.toFixed(0) + '</b>/250 步。' +
         healthText;
 
       document.getElementById('stats').innerHTML =
         '<div class="stat"><div class="label">整体进度</div><div class="value blue">' + (globalCurrent/1e6).toFixed(1) + 'M / ' + (globalTotalSteps/1e6).toFixed(0) + 'M</div></div>' +
-        '<div class="stat"><div class="label">当前奖励</div><div class="value green">' + curReward.toFixed(0) + '</div></div>' +
-        '<div class="stat"><div class="label">最高奖励</div><div class="value yellow">' + bestReward.toFixed(0) + '</div></div>' +
-        '<div class="stat"><div class="label">存活步数</div><div class="value purple">' + curLen.toFixed(0) + '/250</div></div>' +
+        '<div class="stat"><div class="label">当前奖励</div><div class="value green">' + displayCurReward.toFixed(0) + '</div></div>' +
+        '<div class="stat"><div class="label">最高奖励</div><div class="value yellow">' + displayBestReward.toFixed(0) + '</div></div>' +
+        '<div class="stat"><div class="label">存活步数</div><div class="value purple">' + displayLen.toFixed(0) + '/250</div></div>' +
         '<div class="stat"><div class="label">训练速度</div><div class="value blue">' + fps.toFixed(0) + ' fps</div></div>' +
         '<div class="stat"><div class="label">已用时间</div><div class="value">' + (elapsed/3600).toFixed(1) + 'h</div></div>';
 
@@ -691,6 +844,8 @@ function fetchData() {
         // Stage pipeline
         html += '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">';
         const stageList = plan.length > 0 ? plan : [];
+        const doneAllStages = curIdx >= curTotal;
+        const activeIdx = doneAllStages ? Math.max(0, curTotal - 1) : curIdx;
         for (let i = 0; i < Math.max(stageList.length, curTotal); i++) {
           const def = stageList[i] || {};
           const name = def.name || (completedStages[i] ? completedStages[i].name : '阶段' + (i+1));
@@ -702,20 +857,20 @@ function fetchData() {
           const hb = ec.fac_height_bonus || '';
 
           let status, bg, border, textColor;
-          if (i < curIdx) {
+          if (i === activeIdx) {
+            // Active stage (or last stage when all completed)
+            status = doneAllStages ? '✓ 已完成' : '▶ 训练中';
+            bg = '#38bdf825';
+            border = '#38bdf8';
+            textColor = '#38bdf8';
+          } else if (i < curIdx) {
             // Completed
             const completed = completedStages[i];
             const healthy = completed && completed.healthy;
             status = healthy ? '✓' : '✗';
-            bg = healthy ? color + '15' : '#f8717115';
-            border = healthy ? color : '#f87171';
-            textColor = color;
-          } else if (i === curIdx) {
-            // Current
-            status = '▶ 训练中';
-            bg = color + '25';
-            border = color;
-            textColor = '#fff';
+            bg = '#1e293b';
+            border = '#64748b';
+            textColor = '#94a3b8';
           } else {
             // Pending
             status = '待训练';
@@ -756,6 +911,93 @@ function fetchData() {
         curInfoEl.innerHTML = html;
       } else if (curInfoEl) {
         curInfoEl.style.display = 'none';
+      }
+
+      // Render fixed-direction evaluation panel
+      const fepEl = document.getElementById('fixedEvalPanel');
+      const fe = d.fixed_eval;
+      if (fepEl && fe && fe.results) {
+        fepEl.style.display = '';
+        const feTime = fe.evaluated_at ? fe.evaluated_at.replace('T', ' ') : '';
+        const feEps = fe.episodes_per_direction || 0;
+        let feHtml = '<div style="font-size:14px;color:#38bdf8;font-weight:600;margin-bottom:10px;">' +
+          '验收评估（确定性推理） ' +
+          '<span style="font-size:11px;color:#64748b;font-weight:400;">' + feTime +
+          ' · ' + feEps + '局/方向</span></div>';
+
+        const dirs = ['forward', 'backward', 'left', 'right'];
+        const dirCN = {forward:'向前', backward:'向后', left:'向左', right:'向右'};
+        const weakest = fe.weakest_direction;
+        const bestRew = Math.max(...dirs.map(d => (fe.results[d] || {}).mean_episode_reward || 0));
+
+        feHtml += '<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px;">';
+        // Sort by reward descending for display
+        const sortedDirs = dirs.slice().sort(
+          (a, b) => (fe.results[b] || {}).mean_episode_reward - (fe.results[a] || {}).mean_episode_reward
+        );
+        for (const dir of sortedDirs) {
+          const r = fe.results[dir];
+          if (!r) continue;
+          const rew = r.mean_episode_reward || 0;
+          const prog = r.median_target_progress || 0;
+          const isWeak = dir === weakest;
+          const barW = bestRew > 0 ? Math.round(rew / bestRew * 100) : 0;
+          const barColor = isWeak ? '#f87171' : '#38bdf8';
+          const flagColor = isWeak ? '#f87171' : '#4ade80';
+          const flag = isWeak ? '⚠' : '✓';
+          feHtml += '<div style="display:flex;align-items:center;gap:8px;">';
+          feHtml += '<span style="min-width:36px;font-size:13px;color:#94a3b8;">' + (dirCN[dir] || dir) + '</span>';
+          feHtml += '<div style="flex:1;background:#0f172a;border-radius:4px;height:14px;overflow:hidden;">' +
+            '<div style="width:' + barW + '%;background:' + barColor + ';height:100%;border-radius:4px;"></div></div>';
+          feHtml += '<span style="min-width:44px;font-size:13px;color:#e2e8f0;text-align:right;">' + rew.toFixed(0) + '分</span>';
+          feHtml += '<span style="min-width:70px;font-size:11px;color:#64748b;">进度 ' + prog.toFixed(5) + '</span>';
+          feHtml += '<span style="font-size:14px;color:' + flagColor + ';">' + flag + '</span>';
+          feHtml += '</div>';
+        }
+        feHtml += '</div>';
+
+        // Posture summary table
+        feHtml += '<table style="width:100%;border-collapse:collapse;margin-bottom:12px;font-size:13px;">';
+        feHtml += '<tr style="color:#64748b;font-size:11px;">' +
+          '<th style="text-align:left;padding:4px 8px;border-bottom:1px solid #334155;">方向</th>' +
+          '<th style="text-align:right;padding:4px 8px;border-bottom:1px solid #334155;">得分</th>' +
+          '<th style="text-align:right;padding:4px 8px;border-bottom:1px solid #334155;">手臂触地率</th>' +
+          '<th style="text-align:center;padding:4px 8px;border-bottom:1px solid #334155;">状态</th>' +
+          '</tr>';
+        for (const dir of sortedDirs) {
+          const r = fe.results[dir];
+          if (!r) continue;
+          const rew = r.mean_episode_reward || 0;
+          const ac = (r.arm_contact_rate || 0) * 100;
+          const isWalking = ac < 30;
+          const statusText = isWalking ? '走路姿态' : '爬行';
+          const statusColor = isWalking ? '#4ade80' : '#facc15';
+          const isWeak = dir === weakest;
+          const dirColor = isWeak ? '#f87171' : '#e2e8f0';
+          feHtml += '<tr style="border-bottom:1px solid #1e293b;">' +
+            '<td style="padding:5px 8px;color:' + dirColor + ';">' + (dirCN[dir] || dir) + '</td>' +
+            '<td style="padding:5px 8px;text-align:right;color:' + dirColor + ';font-weight:600;">' + rew.toFixed(0) + '</td>' +
+            '<td style="padding:5px 8px;text-align:right;color:#94a3b8;">' + ac.toFixed(1) + '%</td>' +
+            '<td style="padding:5px 8px;text-align:center;color:' + statusColor + ';">' + statusText + '</td>' +
+            '</tr>';
+        }
+        feHtml += '</table>';
+
+        const weakRew = (fe.results[weakest] || {}).mean_episode_reward || 0;
+        const ratio = bestRew > 0 ? (weakRew / bestRew * 100).toFixed(0) : 0;
+        feHtml += '<div style="font-size:12px;color:#f87171;margin-bottom:6px;">' +
+          '最弱方向：' + (dirCN[weakest] || weakest) + '（' + weakRew.toFixed(0) + '分，仅为最强的 ' + ratio + '%）</div>';
+
+        const rec = fe.recommendation || '';
+        feHtml += '<div style="font-size:12px;color:#94a3b8;">建议：' + rec + '</div>';
+        if (rec.startsWith('refine_')) {
+          feHtml += '<div style="font-size:11px;color:#475569;margin-top:4px;font-family:monospace;">' +
+            'python -m jprobot.training.progressive --curriculum ' + rec + ' --auto</div>';
+        }
+
+        fepEl.innerHTML = feHtml;
+      } else if (fepEl) {
+        fepEl.style.display = 'none';
       }
 
       // Render posture analysis
@@ -944,6 +1186,7 @@ VISUALIZATION_HTML = r"""<!DOCTYPE html>
   <label style="color:#94a3b8;">模型选择</label>
   <select id="modelSelect"><option value="best.zip">best.zip</option></select>
   <button id="startBtn" onclick="doControl('start')">开始</button>
+  <button id="foxBtn" onclick="toggleFoxMode()" style="background:#0f766e;border-color:#0f766e;margin-top:4px;font-size:12px;">🦊 Fox 模型</button>
 </div>
 
 <div id="connStatus">未连接</div>
@@ -960,6 +1203,7 @@ VISUALIZATION_HTML = r"""<!DOCTYPE html>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // ─── Scene setup ────────────────────────────────────────────
 const canvas = document.getElementById('canvas3d');
@@ -985,86 +1229,214 @@ controls.dampingFactor = 0.1;
 controls.update();
 
 // ─── Lights ─────────────────────────────────────────────────
-scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
-dirLight.position.set(1, -1, 2);
+// 环境光（暖色调，模拟室内漫反射）
+const ambientLight = new THREE.AmbientLight(0xfff0e0, 0.7);
+scene.add(ambientLight);
+
+// 主光源（偏暖白，从右上方照射，产生阴影）
+const dirLight = new THREE.DirectionalLight(0xfffbe8, 1.4);
+dirLight.position.set(0.8, -1.2, 2.5);
 dirLight.castShadow = true;
-dirLight.shadow.mapSize.set(1024, 1024);
-dirLight.shadow.camera.left = -1; dirLight.shadow.camera.right = 1;
-dirLight.shadow.camera.top = 1; dirLight.shadow.camera.bottom = -1;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -0.5; dirLight.shadow.camera.right = 0.5;
+dirLight.shadow.camera.top = 0.5; dirLight.shadow.camera.bottom = -0.5;
+dirLight.shadow.bias = -0.001;
 scene.add(dirLight);
+
+// 轮廓补光（冷蓝色，从左后方，增强立体感）
+const rimLight = new THREE.DirectionalLight(0xaad4ff, 0.5);
+rimLight.position.set(-1, 1.5, 1);
+scene.add(rimLight);
+
+// 底部反射光（模拟地面反射的暖色）
+const fillLight = new THREE.DirectionalLight(0xffd090, 0.3);
+fillLight.position.set(0, 0, -1);
+scene.add(fillLight);
 
 // ─── Ground plane ───────────────────────────────────────────
 const groundGeo = new THREE.PlaneGeometry(6, 2);
-const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a2a3e, roughness: 0.9 });
+const groundMat = new THREE.MeshToonMaterial({ color: 0x1a1a30 });
 const ground = new THREE.Mesh(groundGeo, groundMat);
 ground.receiveShadow = true;
 ground.position.set(1.5, 0, -0.001);
 scene.add(ground);
 
-// Grid lines (10cm spacing) on XY plane at Z=0
-const gridGroup = new THREE.Group();
-const gridMat = new THREE.LineBasicMaterial({ color: 0x3a3a5e, transparent: true, opacity: 0.5 });
-for (let i = -5; i <= 55; i++) {
-  const x = i * 0.1;
-  const pts = [new THREE.Vector3(x, -1, 0.0005), new THREE.Vector3(x, 1, 0.0005)];
-  gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), gridMat));
-}
-for (let j = -10; j <= 10; j++) {
-  const y = j * 0.1;
-  const pts = [new THREE.Vector3(-0.5, y, 0.0005), new THREE.Vector3(5.5, y, 0.0005)];
-  gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), gridMat));
-}
-scene.add(gridGroup);
+// GridHelper 网格线地板（用 Three.js 内置 GridHelper，旋转到 XY 平面）
+const gridHelper = new THREE.GridHelper(6, 60, 0x3a3aff, 0x2a2a55);
+gridHelper.rotation.x = Math.PI / 2;  // 旋转到 XY 平面（Z-up）
+gridHelper.position.set(1.5, 0, 0.001);
+gridHelper.material.transparent = true;
+gridHelper.material.opacity = 0.45;
+scene.add(gridHelper);
 
 // ─── Robot model ────────────────────────────────────────────
-// URDF dimensions (meters)
-const TORSO_SIZE = [0.105, 0.08, 0.02];
-const UPPER_R = 0.003, UPPER_L = 0.045;
+// URDF dimensions (meters) — 身体比例微调：头偏大、腿细一点、身体更椭圆
+const TORSO_SIZE = [0.11, 0.075, 0.025];   // 身体略高（更椭圆感）
+const UPPER_R = 0.004, UPPER_L = 0.045;    // 腿略粗一点点显得卡通
 const LOWER_R = 0.003, LOWER_L = 0.05;
-const PAW_R = 0.006, PAW_L = 0.008;
+const PAW_R = 0.007, PAW_L = 0.009;        // 爪子略大
 
-// Colors
-const matTorso = new THREE.MeshStandardMaterial({ color: 0xf0c040, roughness: 0.5 });
-const matBattery = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.6 });
-const matUpper = new THREE.MeshStandardMaterial({ color: 0x4488cc, roughness: 0.4 });
-const matLower = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.5 });
-const matPaw = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.6 });
+// ─── 卡通材质（MeshToonMaterial，橘猫配色）───────────────────
+// 橘猫主色：橘黄色身体
+const matTorso   = new THREE.MeshToonMaterial({ color: 0xe8721a });
+// 白色肚子（胸腹部装饰）
+const matBelly    = new THREE.MeshToonMaterial({ color: 0xf5f0e8 });
+// 前腿：橘色上肢
+const matUpperFront = new THREE.MeshToonMaterial({ color: 0xe8721a });
+// 后腿：深橘上肢
+const matUpperBack  = new THREE.MeshToonMaterial({ color: 0xc95e10 });
+// 下肢：深棕色
+const matLower    = new THREE.MeshToonMaterial({ color: 0x8b4513 });
+// 爪子：米白色
+const matPaw      = new THREE.MeshToonMaterial({ color: 0xf5deb3 });
+// 电池/背部装饰：深灰
+const matBattery  = new THREE.MeshToonMaterial({ color: 0x2a2a2a });
+// 耳朵：橘色外耳
+const matEarOuter = new THREE.MeshToonMaterial({ color: 0xe8721a });
+// 耳朵内：粉色内耳
+const matEarInner = new THREE.MeshToonMaterial({ color: 0xff9eb5 });
+// 尾巴：橘棕渐变用橘色
+const matTail     = new THREE.MeshToonMaterial({ color: 0xc95e10 });
 
 const robotGroup = new THREE.Group();
 scene.add(robotGroup);
 
-// Torso
-const torsoMesh = new THREE.Mesh(new THREE.BoxGeometry(...TORSO_SIZE), matTorso);
+// ── 身体（椭球感：用 SphereGeometry 拉伸 + BoxGeometry 叠加）──
+// 主身体用 BoxGeometry，加圆角感用 scale
+const torsoMesh = new THREE.Mesh(
+  new THREE.BoxGeometry(...TORSO_SIZE),
+  matTorso
+);
 torsoMesh.castShadow = true;
 robotGroup.add(torsoMesh);
 
-// Battery
-const batteryMesh = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.04, 0.015), matBattery);
-batteryMesh.position.set(0, 0, -0.015);
+// 身体侧面加圆润感（左右两个小半球）
+const sideBallGeo = new THREE.SphereGeometry(0.013, 8, 6);
+[-1, 1].forEach(sign => {
+  const sideBall = new THREE.Mesh(sideBallGeo, matTorso);
+  sideBall.position.set(0, sign * 0.037, 0);
+  sideBall.scale.set(1.4, 0.7, 0.8);
+  sideBall.castShadow = true;
+  robotGroup.add(sideBall);
+});
+
+// 白色肚皮（正面小平面）
+const bellyMesh = new THREE.Mesh(
+  new THREE.BoxGeometry(0.07, 0.05, 0.003),
+  matBelly
+);
+bellyMesh.position.set(0, 0, 0.013);
+robotGroup.add(bellyMesh);
+
+// ── 头部（大头，更像猫）──
+const headGroup = new THREE.Group();
+headGroup.position.set(0.062, 0, 0.012);
+robotGroup.add(headGroup);
+
+// 头部主体（球形，偏大）
+const headMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(0.028, 12, 10),
+  matTorso
+);
+headMesh.scale.set(1.1, 0.95, 1.0);
+headMesh.castShadow = true;
+headGroup.add(headMesh);
+
+// 脸部白色区域
+const faceMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(0.019, 10, 8),
+  matBelly
+);
+faceMesh.position.set(0.016, 0, -0.002);
+faceMesh.scale.set(0.6, 0.85, 0.9);
+headGroup.add(faceMesh);
+
+// 耳朵（两个锥形，左右各一）
+const earGeo = new THREE.ConeGeometry(0.010, 0.022, 4);  // 四棱锥，像猫耳
+const earInnerGeo = new THREE.ConeGeometry(0.006, 0.015, 4);
+[1, -1].forEach(sign => {
+  // 外耳
+  const ear = new THREE.Mesh(earGeo, matEarOuter);
+  ear.position.set(0.005, sign * 0.020, 0.022);
+  ear.rotation.x = sign * 0.25;  // 略微外八
+  ear.castShadow = true;
+  headGroup.add(ear);
+  // 粉色内耳
+  const earInner = new THREE.Mesh(earInnerGeo, matEarInner);
+  earInner.position.set(0.007, sign * 0.020, 0.022);
+  earInner.rotation.x = sign * 0.25;
+  headGroup.add(earInner);
+});
+
+// ── 尾巴（弯曲感：用多段 CylinderGeometry 拼接）──
+const tailGroup = new THREE.Group();
+tailGroup.position.set(-0.058, 0, 0.005);
+robotGroup.add(tailGroup);
+
+// 尾巴根部
+const tail1 = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.006, 0.008, 0.03, 8),
+  matTail
+);
+tail1.rotation.x = -Math.PI * 0.35;  // 向上翘
+tail1.position.set(-0.005, 0, 0.012);
+tail1.castShadow = true;
+tailGroup.add(tail1);
+
+// 尾巴中段（弯折）
+const tail2 = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.004, 0.006, 0.028, 8),
+  matTail
+);
+tail2.position.set(-0.008, 0, 0.033);
+tail2.rotation.x = -Math.PI * 0.15;
+tail2.castShadow = true;
+tailGroup.add(tail2);
+
+// 尾巴尖（细）
+const tail3 = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.002, 0.004, 0.018, 8),
+  matBelly  // 尾巴尖白色
+);
+tail3.position.set(-0.010, 0, 0.055);
+tail3.rotation.x = Math.PI * 0.1;
+tailGroup.add(tail3);
+
+// Battery / 背部装饰
+const batteryMesh = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.038, 0.012), matBattery);
+batteryMesh.position.set(0, 0, -0.016);
 robotGroup.add(batteryMesh);
 
 // Leg origins from URDF (xyz relative to torso center)
 const legConfig = [
-  { name: 'FL', ox:  0.055, oy:  0.05, elbowOy: -0.015, sign: 1 },  // front-left
-  { name: 'FR', ox:  0.055, oy: -0.05, elbowOy:  0.015, sign: -1 }, // front-right
-  { name: 'BR', ox: -0.055, oy: -0.05, elbowOy:  0.015, sign: -1 }, // back-right
-  { name: 'BL', ox: -0.055, oy:  0.05, elbowOy: -0.015, sign: 1 },  // back-left
+  { name: 'FL', ox:  0.055, oy:  0.05, elbowOy: -0.015, sign: 1,  isFront: true },
+  { name: 'FR', ox:  0.055, oy: -0.05, elbowOy:  0.015, sign: -1, isFront: true },
+  { name: 'BR', ox: -0.055, oy: -0.05, elbowOy:  0.015, sign: -1, isFront: false },
+  { name: 'BL', ox: -0.055, oy:  0.05, elbowOy: -0.015, sign: 1,  isFront: false },
 ];
 
 // Build leg hierarchy: shoulderPivot → upperLimb → elbowStatic → elbowPivot → lowerLimb → paw
 const legs = {};
 legConfig.forEach(cfg => {
+  // 前腿用橘色，后腿用深橘色
+  const matUp = cfg.isFront ? matUpperFront : matUpperBack;
+
   // Shoulder pivot (at URDF joint origin, rotates around Y)
   const shoulderPivot = new THREE.Group();
   shoulderPivot.position.set(cfg.ox, cfg.oy, 0);
   robotGroup.add(shoulderPivot);
 
+  // 肩部关节小球（卡通风格）
+  const shoulderBall = new THREE.Mesh(
+    new THREE.SphereGeometry(0.006, 8, 6),
+    matUp
+  );
+  shoulderPivot.add(shoulderBall);
+
   // Upper limb (cylinder along Z, offset so top is at pivot)
-  const upperGeo = new THREE.CylinderGeometry(UPPER_R, UPPER_R, UPPER_L, 8);
-  const upperMesh = new THREE.Mesh(upperGeo, matUpper);
-  // Cylinder default axis is Y; we need it along -Z
-  // Rotate cylinder 90° around X to align with -Z
+  // 用较大半径 + 较多分段，视觉上更圆润
+  const upperGeo = new THREE.CylinderGeometry(UPPER_R, UPPER_R * 0.8, UPPER_L, 10);
+  const upperMesh = new THREE.Mesh(upperGeo, matUp);
   upperMesh.rotation.x = Math.PI / 2;
   upperMesh.position.set(0, 0, -UPPER_L / 2);
   upperMesh.castShadow = true;
@@ -1073,9 +1445,6 @@ legConfig.forEach(cfg => {
   // Elbow static transform (URDF: rpy(0, -pi/2, 0) at elbow origin)
   const elbowStatic = new THREE.Group();
   elbowStatic.position.set(0, cfg.elbowOy, -UPPER_L);
-  // Apply URDF rpy(0, -pi/2, 0) — in Three.js ZYX convention, this is rotation around Y by -pi/2
-  // But since our coordinate system is Z-up, we need to convert:
-  // URDF rpy(0, -pi/2, 0) means pitch = -90° which rotates the child joint axis
   elbowStatic.rotation.y = -Math.PI / 2;
   shoulderPivot.add(elbowStatic);
 
@@ -1083,19 +1452,29 @@ legConfig.forEach(cfg => {
   const elbowPivot = new THREE.Group();
   elbowStatic.add(elbowPivot);
 
-  // Lower limb
-  const lowerGeo = new THREE.CylinderGeometry(LOWER_R, LOWER_R, LOWER_L, 8);
+  // 肘部关节小球
+  const elbowBall = new THREE.Mesh(
+    new THREE.SphereGeometry(0.005, 8, 6),
+    matLower
+  );
+  elbowPivot.add(elbowBall);
+
+  // Lower limb（略细，锥形感，上粗下细）
+  const lowerGeo = new THREE.CylinderGeometry(LOWER_R * 0.7, LOWER_R, LOWER_L, 10);
   const lowerMesh = new THREE.Mesh(lowerGeo, matLower);
   lowerMesh.rotation.x = Math.PI / 2;
   lowerMesh.position.set(0, 0, -LOWER_L / 2);
   lowerMesh.castShadow = true;
   elbowPivot.add(lowerMesh);
 
-  // Paw (fixed at end of lower limb)
-  const pawGeo = new THREE.CylinderGeometry(PAW_R, PAW_R, PAW_L, 8);
-  const pawMesh = new THREE.Mesh(pawGeo, matPaw);
-  pawMesh.rotation.x = Math.PI / 2;
-  pawMesh.position.set(0, 0, -LOWER_L - PAW_L / 2);
+  // Paw（爪子：扁球形，更可爱）
+  const pawMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(PAW_R, 8, 6),
+    matPaw
+  );
+  pawMesh.scale.set(1.2, 1.0, 0.7);
+  pawMesh.position.set(0, 0, -LOWER_L - PAW_R * 0.7);
+  pawMesh.castShadow = true;
   elbowPivot.add(pawMesh);
 
   legs[cfg.name] = { shoulderPivot, elbowPivot };
@@ -1116,6 +1495,73 @@ const jointMap = [
   { pivot: legs.BL.shoulderPivot, prop: 'y' },  // 6: hip_left
   { pivot: legs.BL.elbowPivot,    prop: 'y' },  // 7: knee_left
 ];
+
+// ─── Fox GLB Model (Route B) ────────────────────────────────
+// Bone mapping: BittleX joint index → Fox skeleton bone name + rotation axis
+// Left side joints use axis 'x' scale +1; Right side use scale -1 (mirrored)
+const FOX_JOINT_MAP = [
+  { bone: 'b_LeftUpperArm_09',  axis: 'x', scale:  1.0 },  // 0: FL shoulder
+  { bone: 'b_LeftForeArm_010',  axis: 'x', scale:  1.0 },  // 1: FL elbow
+  { bone: 'b_RightUpperArm_06', axis: 'x', scale: -1.0 },  // 2: FR shoulder
+  { bone: 'b_RightForeArm_07',  axis: 'x', scale: -1.0 },  // 3: FR elbow
+  { bone: 'b_RightLeg01_019',   axis: 'x', scale: -1.0 },  // 4: BR hip
+  { bone: 'b_RightLeg02_020',   axis: 'x', scale: -1.0 },  // 5: BR knee
+  { bone: 'b_LeftLeg01_015',    axis: 'x', scale:  1.0 },  // 6: BL hip
+  { bone: 'b_LeftLeg02_016',    axis: 'x', scale:  1.0 },  // 7: BL knee
+];
+
+let foxMode = false;
+let foxBones = {};
+let foxRestAngles = {};
+
+// foxWrapper: receives PyBullet position/quaternion (same coordinate system as robotGroup)
+const foxWrapper = new THREE.Group();
+foxWrapper.visible = false;
+scene.add(foxWrapper);
+
+const foxLoader = new GLTFLoader();
+foxLoader.load('/assets/Fox.glb', (gltf) => {
+  const foxModel = gltf.scene;
+
+  // Fox.glb is glTF Y-up; our scene is Z-up (PyBullet).
+  // Rotate to align: X=-90° flips Y-up→Z-up; Z=180° makes fox face X-forward.
+  foxModel.rotation.x = -Math.PI / 2;
+  foxModel.rotation.z = Math.PI;
+
+  // Scale: Fox model is ~200 glTF units tall.
+  // BittleX torso = 0.11m → fox scaled to similar size (~0.12m body length).
+  foxModel.scale.set(0.00065, 0.00065, 0.00065);
+
+  foxWrapper.add(foxModel);
+
+  // Collect all Bone nodes from the skeleton
+  gltf.scene.traverse(obj => {
+    if (obj.isBone) foxBones[obj.name] = obj;
+  });
+  console.log('Fox GLB loaded. Bones found:', Object.keys(foxBones));
+
+  // Save rest pose rotations so we apply joint angles as deltas
+  FOX_JOINT_MAP.forEach(jm => {
+    const b = foxBones[jm.bone];
+    if (b) {
+      foxRestAngles[jm.bone] = { x: b.rotation.x, y: b.rotation.y, z: b.rotation.z };
+    } else {
+      console.warn('Fox bone not found in skeleton:', jm.bone);
+    }
+  });
+}, undefined, (err) => {
+  console.error('Failed to load Fox.glb:', err);
+});
+
+window.toggleFoxMode = function() {
+  foxMode = !foxMode;
+  robotGroup.visible = !foxMode;
+  foxWrapper.visible = foxMode;
+  const btn = document.getElementById('foxBtn');
+  btn.textContent = foxMode ? '🐱 卡通猫' : '🦊 Fox 模型';
+  btn.style.background = foxMode ? '#e8721a' : '#0f766e';
+  btn.style.borderColor = foxMode ? '#c95e10' : '#0f766e';
+};
 
 // ─── Trajectory trail ───────────────────────────────────────
 const MAX_TRAIL = 2000;
@@ -1173,6 +1619,11 @@ function connectSSE() {
     } else if (d.state === 'stopped' || d.state === 'error') {
       isRunning = false;
       updateBtn(false);
+      if (d.state === 'error') {
+        const msg = d.message || '\u53ef\u89c6\u5316\u5f15\u64ce\u542f\u52a8\u5931\u8d25';
+        cs.textContent = '\u9519\u8bef: ' + msg;
+        cs.className = 'error';
+      }
     }
   });
 
@@ -1195,12 +1646,27 @@ function connectSSE() {
     robotGroup.position.set(px, py, pz);
     robotGroup.quaternion.set(qx, qy, qz, qw);
 
-    // Update joint angles
+    // Fox wrapper follows same position/orientation as robot
+    foxWrapper.position.set(px, py, pz);
+    foxWrapper.quaternion.set(qx, qy, qz, qw);
+
+    // Update joint angles (toon cat)
     d.joints.forEach((angle, i) => {
       if (jointMap[i]) {
         jointMap[i].pivot.rotation[jointMap[i].prop] = angle;
       }
     });
+
+    // Update Fox skeleton bones (Route B)
+    if (foxMode && Object.keys(foxBones).length > 0) {
+      d.joints.forEach((angle, i) => {
+        const jm = FOX_JOINT_MAP[i];
+        if (jm && foxBones[jm.bone]) {
+          const rest = foxRestAngles[jm.bone] || { x: 0, y: 0, z: 0 };
+          foxBones[jm.bone].rotation[jm.axis] = rest[jm.axis] + angle * jm.scale;
+        }
+      });
+    }
 
     // Distance & speed
     const dist = px - (d.step === 1 ? px : 0);
@@ -1482,6 +1948,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             posture = parse_posture_eval()
             posture_history = parse_posture_history()
             curricula = get_curriculum_plan()
+            live_progress = parse_live_progress()
+            fixed_eval = parse_fixed_eval()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -1489,7 +1957,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({
                 "metrics": metrics, "stage": stage,
                 "posture": posture, "posture_history": posture_history,
-                "curricula": curricula,
+                "curricula": curricula, "live_progress": live_progress,
+                "fixed_eval": fixed_eval,
             }).encode("utf-8"))
 
         elif self.path == "/viz":
@@ -1516,6 +1985,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/api/viz/stream":
             self._handle_sse()
+
+        elif self.path == "/assets/Fox.glb":
+            glb_path = "/Users/mlamp/Workspace/cat_model/Fox.glb"
+            if os.path.exists(glb_path):
+                with open(glb_path, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "model/gltf-binary")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_response(404)
+                self.end_headers()
 
         else:
             self.send_response(404)
@@ -1618,17 +2102,31 @@ def main():
 
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer(("0.0.0.0", args.port), DashboardHandler)
+    pid = os.getpid()
+    cmd_hint = f"conda run -n jprobot python scripts/training_server.py --port {args.port}"
     print(f"JPRobot Training Dashboard")
+    print(f"  PID: {pid}")
+    print(f"  Port: {args.port}")
+    print(f"  Trained dir: {trained_dir}")
     print(f"  Dashboard: http://127.0.0.1:{args.port}/dashboard")
     print(f"  3D Viz:    http://127.0.0.1:{args.port}/viz")
     print(f"  Log: {args.log}")
+    print(f"  Recommended foreground start: {cmd_hint}")
+    print(f"  Note: If 127.0.0.1:{args.port} is not LISTEN, dashboard/viz will refuse connection.")
     print(f"  Press Ctrl+C to stop")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        eval_engine.stop()
-        print("\nStopped.")
+        print("\nStopped by user.")
+    except Exception as e:
+        print(f"\n[FATAL] training_server crashed: {type(e).__name__}: {e}")
+        raise
+    finally:
+        try:
+            eval_engine.stop()
+        except Exception:
+            pass
         server.server_close()
 
 
