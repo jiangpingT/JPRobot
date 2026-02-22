@@ -1741,9 +1741,8 @@ function connectSSE() {
     robotGroup.position.set(px, py, pz);
     robotGroup.quaternion.set(qx, qy, qz, qw);
 
-    // Fox wrapper follows same position/orientation as robot
-    // +0.04 Z offset: slight lift so Fox doesn't sink into ground.
-    foxWrapper.position.set(px, py, pz + 0.04);
+    // Fox wrapper follows same position/orientation as robot (same height as cat)
+    foxWrapper.position.set(px, py, pz);
     foxWrapper.quaternion.set(qx, qy, qz, qw);
 
     // Update joint angles (toon cat)
