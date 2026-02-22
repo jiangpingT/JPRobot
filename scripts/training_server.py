@@ -23,132 +23,55 @@ from socketserver import ThreadingMixIn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Default log file (current training)
-DEFAULT_LOG = "/tmp/ab_test/jprobot.log"
-PROGRESSIVE_STATE = os.path.join(os.path.dirname(__file__), "..", "trained", "progressive_state.json")
-POSTURE_EVAL = os.path.join(os.path.dirname(__file__), "..", "trained", "posture_eval.json")
-POSTURE_HISTORY = os.path.join(os.path.dirname(__file__), "..", "trained", "posture_eval_history.jsonl")
-LIVE_PROGRESS = os.path.join(os.path.dirname(__file__), "..", "trained", "live_progress.json")
-FIXED_EVAL = os.path.join(os.path.dirname(__file__), "..", "trained", "fixed_direction_eval.json")
+DASHBOARD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
 
 
-def parse_fixed_eval():
-    """Read fixed-direction evaluation results if available."""
-    path = os.path.abspath(FIXED_EVAL)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
+def find_live_dashboard() -> dict | None:
+    """扫描 DASHBOARD_DIR 下所有 live_dashboard.json，返回 mtime 最新的那个。"""
+    best_mtime = 0.0
+    best_spec   = None
+    best_dir    = None
+    for root, _dirs, files in os.walk(DASHBOARD_DIR):
+        if "live_dashboard.json" in files:
+            p = os.path.join(root, "live_dashboard.json")
+            try:
+                mtime = os.path.getmtime(p)
+                if mtime > best_mtime:
+                    with open(p, encoding="utf-8") as f:
+                        spec = json.load(f)
+                    best_mtime = mtime
+                    best_spec  = spec
+                    best_dir   = root
+            except (OSError, json.JSONDecodeError):
+                pass
+    if best_spec is not None:
+        # 把 dir 附到 spec，供 parse_history 定位 history_file
+        best_spec["_dir"] = best_dir
+    return best_spec
 
 
-def parse_progressive_state():
-    """Read progressive training state if available."""
-    path = os.path.abspath(PROGRESSIVE_STATE)
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
-
-
-def parse_live_progress():
-    """Read live training progress written by LiveProgressCallback (every rollout)."""
-    path = os.path.abspath(LIVE_PROGRESS)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def parse_posture_eval():
-    """Read posture evaluation metrics if available."""
-    path = os.path.abspath(POSTURE_EVAL)
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
-
-
-def get_curriculum_plan():
-    """Return curriculum stage definitions for dashboard display.
-
-    Parses progressive.py source directly to avoid importing pybullet
-    (which env.py triggers on import).
-    """
-    prog_path = os.path.join(os.path.dirname(__file__), "..", "jprobot", "training", "progressive.py")
-    prog_path = os.path.abspath(prog_path)
-    if not os.path.exists(prog_path):
-        return {}
-    try:
-        import ast
-        with open(prog_path) as f:
-            tree = ast.parse(f.read())
-        # Execute only the constants we need (no side effects)
-        # Collect all top-level assignments that CURRICULA may reference
-        ns = {}
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and (
-                        target.id == 'CURRICULA'
-                        or target.id.startswith('_')
-                        and target.id.endswith('_CONFIG')
-                    ):
-                        exec(compile(ast.Module(body=[node], type_ignores=[]), prog_path, 'exec'), ns)
-        return ns.get('CURRICULA', {})
-    except Exception:
-        return {}
-
-
-def parse_posture_history():
-    """Read posture history JSONL for trend charts."""
-    path = os.path.abspath(POSTURE_HISTORY)
+def parse_history(spec: dict) -> list:
+    """读 spec['history_file'] 对应的 JSONL，返回 list of dict。"""
+    history_file = spec.get("history_file")
+    base_dir     = spec.get("_dir")
+    if not history_file or not base_dir:
+        return []
+    path = os.path.join(base_dir, history_file)
     if not os.path.exists(path):
         return []
     points = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    points.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        points.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    except OSError:
+        pass
     return points
-
-
-def parse_training_log(filepath):
-    """Extract metrics from stable-baselines3 training output."""
-    if not os.path.exists(filepath):
-        return []
-
-    with open(filepath, "r") as f:
-        content = f.read()
-
-    metrics = []
-    blocks = content.split("---")
-    current = {}
-    for block in blocks:
-        for line in block.strip().split("\n"):
-            line = line.strip().strip("|").strip()
-            if not line:
-                continue
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) == 2:
-                key, val = parts
-                try:
-                    current[key.strip()] = float(val.strip())
-                except ValueError:
-                    pass
-        if "total_timesteps" in current and "ep_rew_mean" in current:
-            metrics.append(dict(current))
-            current = {}
-    return metrics
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -260,9 +183,16 @@ class EvalEngine:
 
     def _resolve_model_path(self, model_name):
         if model_name == "__latest__":
-            # Real-time mode should follow the newest checkpoint/snapshot.
-            # Skip files that are still being written and keep last good model.
             return self._find_latest_model()
+        base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+        if model_name == "__route_a__":
+            return os.path.join(base, "route_a_v3", "snapshots", "best.zip")
+        if model_name == "__route_b__":
+            return os.path.join(base, "route_b_v4", "snapshots", "best.zip")
+        # Backflip 各训练阶段
+        for bf_stage in ("jump", "rotate", "land", "full"):
+            if model_name == f"__backflip_{bf_stage}__":
+                return os.path.join(base, "backflip", bf_stage, "best.zip")
         # Try snapshots/ first, then checkpoints/, then direct path
         for subdir in ("snapshots", "checkpoints", ""):
             path = os.path.join(self.trained_dir, subdir, model_name) if subdir else os.path.join(self.trained_dir, model_name)
@@ -271,9 +201,28 @@ class EvalEngine:
         return None
 
     def _run_loop(self):
+        if self.current_model == "__moe__":
+            self._run_loop_moe()
+            return
+
         import pybullet as p
         from stable_baselines3 import PPO
-        from jprobot.training.env import BittleGymEnv
+
+        # Route A v3 → BittleGymEnvV2（direction-reward，obs=254）
+        if self.current_model == "__route_a__":
+            from jprobot.training.env_v2 import BittleGymEnvV2 as _EnvCls
+            _env_kwargs = {"render_mode": None}
+        # Route B v4 → BittleGymEnvVelocityV2（velocity-tracking，obs=254）
+        elif self.current_model == "__route_b__":
+            from jprobot.training.env_velocity_v2 import BittleGymEnvVelocityV2 as _EnvCls
+            _env_kwargs = {"render_mode": None}
+        # Backflip 各阶段 → BittleBackflipEnv（obs=23，training_phase="full" 全奖励可视化）
+        elif self.current_model.startswith("__backflip"):
+            from jprobot.training.env_backflip import BittleBackflipEnv as _EnvCls
+            _env_kwargs = {"render_mode": None, "training_phase": "full"}
+        else:
+            from jprobot.training.env import BittleGymEnv as _EnvCls
+            _env_kwargs = {"render_mode": None}
 
         model_path = self._resolve_model_path(self.current_model)
         if not model_path:
@@ -286,7 +235,7 @@ class EvalEngine:
         self._broadcast("status", {"state": "loading", "model": self.current_model})
 
         try:
-            env = BittleGymEnv(render_mode=None)
+            env = _EnvCls(**_env_kwargs)
             model = PPO.load(model_path)
         except Exception as e:
             self._broadcast("status", {"state": "error", "message": str(e)})
@@ -396,6 +345,142 @@ class EvalEngine:
             self.running = False
             self._broadcast("status", {"state": "stopped"})
 
+    def _run_loop_moe(self):
+        """MoE 可视化：向前用 Route A，其余用 Route B（obs 自动转换）。
+
+        路径从 moe_eval.json 读取（model_a / model_b 绝对路径）。
+        env: BittleGymEnvV2（与 Route A 训练环境完全一致，obs=254）。
+        obs 转换：Route A env obs[248:250](target_dir) → vel_cmd_scaled(2)，
+                  obs[250:254](feet_contact) 直接复用（两个环境相同）。
+        """
+        import numpy as _np
+        import pybullet as p
+        from stable_baselines3 import PPO
+        from jprobot.training.env_v2 import BittleGymEnvV2
+
+        # 读取 moe_eval.json 获取两个模型的绝对路径
+        moe_path = os.path.abspath(MOE_EVAL)
+        if not os.path.exists(moe_path):
+            self._broadcast("status", {"state": "error", "message": f"moe_eval.json 不存在: {moe_path}"})
+            self.running = False
+            self.state = "idle"
+            return
+
+        with open(moe_path) as f:
+            moe_data = json.load(f)
+        model_a_path = moe_data["model_a"]
+        model_b_path = moe_data["model_b"]
+
+        _VEL_CMD_MAP = {
+            "forward":  _np.array([ 0.25,  0.0], dtype=_np.float32),
+            "backward": _np.array([-0.25,  0.0], dtype=_np.float32),
+            "left":     _np.array([ 0.0,   0.25], dtype=_np.float32),
+            "right":    _np.array([ 0.0,  -0.25], dtype=_np.float32),
+        }
+        _VEL_SCALE = 2.5
+
+        self.state = "loading"
+        self._broadcast("status", {"state": "loading", "model": "__moe__"})
+        try:
+            model_a = PPO.load(model_a_path)
+            model_b = PPO.load(model_b_path)
+            b_obs_dim = model_b.observation_space.shape[0]
+            env = BittleGymEnvV2(render_mode=None)
+        except Exception as e:
+            self._broadcast("status", {"state": "error", "message": str(e)})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "running"
+        self._broadcast("status", {
+            "state": "running", "model": "__moe__",
+            "model_a": os.path.basename(os.path.dirname(model_a_path)) + "/best.zip",
+            "model_b": os.path.basename(os.path.dirname(model_b_path)) + "/best.zip",
+        })
+
+        episode = 0
+        try:
+            while self.running:
+                episode += 1
+                obs, _ = env.reset()
+                total_reward = 0.0
+                max_distance = 0.0
+                start_xy = None
+
+                target_name = getattr(env, "target_name", "forward")
+                target_dir  = getattr(env, "target_dir_xy", _np.array([1.0, 0.0]))
+                use_model   = "A" if target_name == "forward" else "B"
+                vel_cmd     = _VEL_CMD_MAP.get(target_name, _np.array([0.25, 0.0]))
+
+                self._broadcast("episode_start", {
+                    "episode": episode,
+                    "direction": target_name,
+                    "model_used": use_model,
+                })
+
+                step = 0
+                while self.running:
+                    if use_model == "A":
+                        action, _ = model_a.predict(obs, deterministic=True)
+                    else:
+                        vel_scaled = _np.clip(vel_cmd * _VEL_SCALE, -1.0, 1.0)
+                        if b_obs_dim == 254:
+                            obs_b = _np.concatenate([obs[:248], vel_scaled, obs[250:254]]).astype(_np.float32)
+                        else:
+                            obs_b = _np.concatenate([obs[:248], vel_scaled]).astype(_np.float32)
+                        action, _ = model_b.predict(obs_b, deterministic=True)
+
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    step += 1
+                    total_reward += reward
+
+                    pos, orn = p.getBasePositionAndOrientation(
+                        env.robot_id, physicsClientId=env.physics_client
+                    )
+                    if start_xy is None:
+                        start_xy = (pos[0], pos[1])
+                    delta = (pos[0] - start_xy[0], pos[1] - start_xy[1])
+                    distance = float(_np.dot(delta, target_dir))
+                    max_distance = max(max_distance, distance)
+
+                    joints = []
+                    for ji in env.joint_id:
+                        js = p.getJointState(env.robot_id, ji, physicsClientId=env.physics_client)
+                        joints.append(round(js[0], 4))
+
+                    self._broadcast("frame", {
+                        "step": step,
+                        "position": [round(v, 5) for v in pos],
+                        "orientation": [round(v, 5) for v in orn],
+                        "joints": joints,
+                        "reward": round(float(reward), 2),
+                        "model_used": use_model,
+                    })
+
+                    time.sleep(0.02)
+
+                    if terminated or truncated:
+                        break
+
+                self._broadcast("episode_end", {
+                    "episode": episode,
+                    "total_reward": round(total_reward, 2),
+                    "steps": step,
+                    "survived": not terminated,
+                    "max_distance": round(max_distance, 4),
+                    "direction": target_name,
+                    "model_used": use_model,
+                })
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+            self.state = "idle"
+            self.running = False
+            self._broadcast("status", {"state": "stopped"})
+
 
 # Global eval engine instance (created in main)
 eval_engine = None
@@ -413,703 +498,208 @@ DASHBOARD_HTML = """<!DOCTYPE html>
          background: #0f172a; color: #e2e8f0; padding: 20px; }
   h1 { text-align: center; margin-bottom: 6px; font-size: 26px; color: #38bdf8; }
   .subtitle { text-align: center; color: #64748b; margin-bottom: 16px; font-size: 13px; }
-  .btn-row { text-align: center; margin-bottom: 20px; }
-  .btn { background: #6366f1; color: white; border: none; padding: 10px 24px;
-         border-radius: 8px; cursor: pointer; font-size: 14px; margin: 0 6px; }
-  .btn:hover { background: #818cf8; }
-  .btn:active { background: #4f46e5; }
-  .summary { background: #1e293b; border-radius: 10px; padding: 16px; margin-bottom: 20px;
-             line-height: 1.8; font-size: 14px; color: #cbd5e1; }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-           gap: 12px; margin-bottom: 24px; }
-  .stat { background: #1e293b; border-radius: 10px; padding: 16px; text-align: center; }
-  .stat .label { font-size: 12px; color: #94a3b8; }
-  .stat .value { font-size: 26px; font-weight: 700; margin-top: 4px; }
-  .green { color: #4ade80; } .blue { color: #38bdf8; }
-  .yellow { color: #facc15; } .purple { color: #c084fc; }
-  .red { color: #f87171; }
-  .section-title { font-size: 16px; color: #94a3b8; margin: 20px 0 12px 0; padding-left: 4px;
-                   border-left: 3px solid #6366f1; padding-left: 10px; }
-  .health { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  .no-data { text-align: center; color: #475569; margin-top: 80px; font-size: 18px; }
+  .progress-wrap { background: #1e293b; border-radius: 10px; padding: 16px; margin-bottom: 20px; }
+  .progress-label { font-size: 13px; color: #94a3b8; margin-bottom: 8px; }
+  .progress-bar-bg { background: #0f172a; border-radius: 6px; height: 18px; overflow: hidden; }
+  .progress-bar { background: linear-gradient(90deg,#6366f1,#38bdf8); height: 100%;
+                  border-radius: 6px; transition: width 0.5s; }
+  .stages { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
             gap: 12px; margin-bottom: 24px; }
-  .health-card { background: #1e293b; border-radius: 10px; padding: 14px; }
-  .health-card .h-name { font-size: 13px; color: #94a3b8; margin-bottom: 2px; }
-  .health-card .h-cn { font-size: 11px; color: #64748b; margin-bottom: 6px; }
-  .health-card .h-val { font-size: 22px; font-weight: 700; }
-  .health-card .h-hint { font-size: 11px; margin-top: 4px; }
-  .h-good { color: #4ade80; } .h-warn { color: #facc15; } .h-bad { color: #f87171; }
-  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  .chart-box { background: #1e293b; border-radius: 10px; padding: 16px; }
+  .stage-card { background: #1e293b; border-radius: 10px; padding: 14px;
+                border: 2px solid transparent; }
+  .stage-card.done { border-color: #4ade80; }
+  .stage-card .s-label { font-size: 13px; color: #94a3b8; margin-bottom: 2px; }
+  .stage-card .s-name  { font-size: 16px; font-weight: 700; color: #e2e8f0; }
+  .stage-card .s-rew   { font-size: 22px; font-weight: 700; color: #38bdf8; margin-top: 4px; }
+  .stage-card .s-note  { font-size: 11px; color: #64748b; margin-top: 3px; }
+  .stage-card .s-done  { font-size: 11px; color: #4ade80; margin-top: 3px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+             gap: 12px; margin-bottom: 24px; }
+  .metric-card { background: #1e293b; border-radius: 10px; padding: 14px; text-align: center; }
+  .metric-card .m-label { font-size: 12px; color: #94a3b8; }
+  .metric-card .m-value { font-size: 26px; font-weight: 700; margin-top: 4px; }
+  .color-green  { color: #4ade80; }
+  .color-blue   { color: #38bdf8; }
+  .color-yellow { color: #facc15; }
+  .color-purple { color: #c084fc; }
+  .color-red    { color: #f87171; }
+  .chart-box { background: #1e293b; border-radius: 10px; padding: 16px; margin-bottom: 20px; }
   .chart-box h3 { font-size: 14px; color: #94a3b8; margin-bottom: 10px; }
-  canvas { max-height: 280px; }
-  .status { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; }
-  .status.running { background: #166534; color: #4ade80; }
-  .status.done { background: #1e3a5f; color: #38bdf8; }
-  @media (max-width: 800px) { .charts { grid-template-columns: 1fr; } .health { grid-template-columns: 1fr 1fr; } }
+  canvas { max-height: 260px; }
+  .section-title { font-size: 14px; color: #94a3b8; margin: 20px 0 10px 0;
+                   padding-left: 10px; border-left: 3px solid #6366f1; }
+  .viz-link { display: inline-block; margin: 0 auto; background: #1e293b;
+              color: #38bdf8; padding: 8px 20px; border-radius: 8px; text-decoration: none;
+              border: 1px solid #334155; font-size: 13px; }
+  .viz-link:hover { background: #334155; }
+  .top-bar { display: flex; justify-content: space-between; align-items: center;
+             margin-bottom: 20px; }
+  .updated { font-size: 11px; color: #475569; }
 </style>
 </head>
 <body>
-<h1>JPRobot 训练面板</h1>
-<p class="subtitle">
-  <span id="statusBadge" class="status running">训练中</span>
-  &nbsp; 每15秒自动刷新 &nbsp;|&nbsp; <span id="lastUpdate"></span>
-</p>
-
-<div class="btn-row">
-  <button class="btn" onclick="fetchData()">刷新数据</button>
-  <a class="btn" href="/viz" style="text-decoration:none;display:inline-block;">3D 可视化</a>
+<div class="top-bar">
+  <div>
+    <h1 id="pageTitle">JPRobot 训练面板</h1>
+    <div class="subtitle" id="pageSubtitle">加载中...</div>
+  </div>
+  <a class="viz-link" href="/viz">3D 可视化 →</a>
 </div>
 
-<div class="summary" id="summary">加载中...</div>
+<div id="app">
+  <div class="no-data" id="noData" style="display:none;">暂无训练数据<br><small style="font-size:13px;color:#334155;">等待 live_dashboard.json...</small></div>
 
-<div class="stats" id="stats"></div>
+  <div id="mainContent" style="display:none;">
+    <!-- 进度条 -->
+    <div class="progress-wrap">
+      <div class="progress-label" id="progressLabel">进度</div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar" id="progressBar" style="width:0%"></div>
+      </div>
+    </div>
 
-<div id="curriculumInfo" style="display:none;background:#1e293b;border-radius:10px;padding:14px 18px;margin-bottom:20px;border-left:3px solid #c084fc;">
-</div>
+    <!-- 阶段卡片 -->
+    <div class="section-title">训练阶段</div>
+    <div class="stages" id="stagesGrid"></div>
 
-<div id="fixedEvalPanel" style="display:none;background:#1e293b;border-radius:10px;padding:14px 18px;margin-bottom:20px;border-left:3px solid #38bdf8;">
-</div>
+    <!-- 指标卡片 -->
+    <div class="section-title">当前指标</div>
+    <div class="metrics" id="metricsGrid"></div>
 
-<h2 class="section-title" id="postureTitle" style="display:none;">行为分析（机器狗是在走路还是在爬行？）</h2>
-<div class="health" id="posture" style="margin-bottom:20px;"></div>
-
-<h2 class="section-title" id="postureTrendTitle" style="display:none;">姿态趋势（课程学习核心指标）</h2>
-<div class="charts" id="postureTrendCharts" style="display:none;margin-bottom:24px;">
-  <div class="chart-box">
-    <h3>身体高度（目标 > 0.07m = 站立）</h3>
-    <canvas id="heightChart"></canvas>
-  </div>
-  <div class="chart-box">
-    <h3>手臂触地率（目标 < 30% = 用腿走路）</h3>
-    <canvas id="armContactChart"></canvas>
-  </div>
-</div>
-
-<h2 class="section-title" id="stageHistoryTitle" style="display:none;">已完成阶段</h2>
-<div id="stageHistory" style="margin-bottom:20px;display:flex;flex-wrap:wrap;gap:8px;"></div>
-
-<h2 class="section-title">训练健康指标 <span style="font-size:12px;color:#64748b;font-weight:400;">（约束条件：ent_coef=0.0 纯策略梯度 / lr=3e-4 常数学习率 / clip_range=0.2 策略每次最多变±20%）</span></h2>
-<div class="health" id="health"></div>
-
-<div class="charts">
-  <div class="chart-box">
-    <h3>奖励曲线（越高越好：机器狗走得越远奖励越高）</h3>
-    <canvas id="rewardChart"></canvas>
-  </div>
-  <div class="chart-box">
-    <h3>存活步数（越高越好：250满分表示不摔倒）</h3>
-    <canvas id="lenChart"></canvas>
-  </div>
-  <div class="chart-box">
-    <h3>策略损失（训练过程的波动，正常会震荡）</h3>
-    <canvas id="lossChart"></canvas>
-  </div>
-  <div class="chart-box">
-    <h3>探索系数（逐渐下降 = 动作越来越精确）</h3>
-    <canvas id="stdChart"></canvas>
+    <!-- 奖励曲线 -->
+    <div class="section-title">奖励曲线</div>
+    <div class="chart-box">
+      <h3>ep_rew_mean vs 训练步数</h3>
+      <canvas id="rewChart"></canvas>
+    </div>
   </div>
 </div>
+
+<div class="updated" id="updatedAt" style="text-align:right;margin-top:12px;"></div>
 
 <script>
-let charts = {};
+let rewChart = null;
 
-const chartOpts = {
-  responsive: true,
-  animation: { duration: 300 },
-  plugins: { legend: { display: false } },
-  scales: {
-    x: { title: { display: true, text: '训练步数 (百万)', color: '#64748b' },
-         ticks: { color: '#64748b', maxTicksLimit: 15 }, grid: { color: '#334155' } },
-    y: { ticks: { color: '#64748b' }, grid: { color: '#334155' } }
+function colorClass(c) {
+  const map = {green:'color-green', blue:'color-blue', yellow:'color-yellow',
+               purple:'color-purple', red:'color-red'};
+  return map[c] || 'color-blue';
+}
+
+function fmtSteps(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + 'K';
+  return String(n);
+}
+
+function renderSpec(spec) {
+  // Title
+  document.getElementById('pageTitle').textContent = spec.title || 'JPRobot 训练面板';
+
+  // Progress
+  const prog = spec.progress || {};
+  const cur  = prog.current_steps || 0;
+  const tot  = prog.total_steps   || 1;
+  const pct  = Math.min(100, (cur / tot * 100)).toFixed(1);
+  document.getElementById('progressLabel').textContent =
+    `总进度  ${fmtSteps(cur)} / ${fmtSteps(tot)}  (${pct}%)`;
+  document.getElementById('progressBar').style.width = pct + '%';
+
+  // Stages
+  const sg = document.getElementById('stagesGrid');
+  sg.innerHTML = '';
+  for (const s of (spec.stages || [])) {
+    const card = document.createElement('div');
+    card.className = 'stage-card' + (s.done ? ' done' : '');
+    card.innerHTML = `
+      <div class="s-label">${s.name}</div>
+      <div class="s-name">${s.label || s.name}</div>
+      <div class="s-rew">${s.reward !== undefined ? s.reward : '-'}</div>
+      ${s.note ? `<div class="s-note">${s.note}</div>` : ''}
+      <div class="s-done">${s.done ? '✓ 已完成' : '训练中...'}</div>
+    `;
+    sg.appendChild(card);
   }
-};
 
-function createChart(id, color) {
-  return new Chart(document.getElementById(id), {
+  // Metrics
+  const mg = document.getElementById('metricsGrid');
+  mg.innerHTML = '';
+  for (const m of (spec.metrics || [])) {
+    const card = document.createElement('div');
+    card.className = 'metric-card';
+    card.innerHTML = `
+      <div class="m-label">${m.label}</div>
+      <div class="m-value ${colorClass(m.color)}">${m.value}</div>
+    `;
+    mg.appendChild(card);
+  }
+
+  // Updated at
+  document.getElementById('updatedAt').textContent =
+    spec.updated_at ? `更新于 ${spec.updated_at}` : '';
+}
+
+function renderHistory(history) {
+  const canvas = document.getElementById('rewChart');
+  const labels = history.map(p => fmtSteps(p.total_timesteps));
+  const data   = history.map(p => p.ep_rew_mean);
+
+  // Color points by stage
+  const stageColors = {jump:'#6366f1', rotate:'#38bdf8', land:'#4ade80', full:'#facc15'};
+  const pointColors = history.map(p => stageColors[p.stage] || '#94a3b8');
+
+  if (rewChart) rewChart.destroy();
+  rewChart = new Chart(canvas, {
     type: 'line',
-    data: { labels: [], datasets: [{ data: [], borderColor: color, borderWidth: 2, pointRadius: 0, fill: false }] },
-    options: chartOpts
+    data: {
+      labels,
+      datasets: [{
+        label: '奖励 (ep_rew_mean)',
+        data,
+        borderColor: '#38bdf8',
+        backgroundColor: 'rgba(56,189,248,0.1)',
+        pointBackgroundColor: pointColors,
+        pointRadius: history.length > 200 ? 0 : 3,
+        borderWidth: 2,
+        tension: 0.3,
+        fill: true,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { labels: { color: '#94a3b8' } } },
+      scales: {
+        x: { ticks: { color: '#64748b', maxTicksLimit: 10 },
+             grid: { color: '#1e293b' } },
+        y: { ticks: { color: '#64748b' },
+             grid: { color: '#334155' } },
+      }
+    }
   });
 }
 
-function createChartWithTarget(id, color, targetVal, targetLabel) {
-  const opts = JSON.parse(JSON.stringify(chartOpts));
-  opts.plugins = {
-    legend: { display: false },
-    annotation: { annotations: {
-      target: { type: 'line', yMin: targetVal, yMax: targetVal,
-                borderColor: '#facc15', borderWidth: 1, borderDash: [6, 3],
-                label: { display: true, content: targetLabel, position: 'end',
-                         color: '#facc15', font: { size: 10 } } }
-    }}
-  };
-  return new Chart(document.getElementById(id), {
-    type: 'line',
-    data: { labels: [], datasets: [{ data: [], borderColor: color, borderWidth: 2, pointRadius: 0, fill: false }] },
-    options: opts
-  });
+async function fetchData() {
+  try {
+    const r = await fetch('/api/data');
+    if (!r.ok) return;
+    const d = await r.json();
+
+    const hasData = d.spec && d.spec.title;
+    document.getElementById('noData').style.display      = hasData ? 'none'  : 'block';
+    document.getElementById('mainContent').style.display = hasData ? 'block' : 'none';
+
+    if (hasData) {
+      renderSpec(d.spec);
+      if (d.history && d.history.length > 0) renderHistory(d.history);
+    }
+  } catch(e) {
+    console.error('fetchData error:', e);
+  }
 }
 
-function initCharts() {
-  charts.reward = createChart('rewardChart', '#4ade80');
-  charts.len = createChart('lenChart', '#c084fc');
-  charts.loss = createChart('lossChart', '#fb923c');
-  charts.std = createChart('stdChart', '#38bdf8');
-  charts.height = createChart('heightChart', '#38bdf8');
-  charts.armContact = createChart('armContactChart', '#fb923c');
-}
-
-function updateChart(chart, labels, data) {
-  chart.data.labels = labels;
-  chart.data.datasets[0].data = data;
-  chart.update('none');
-}
-
-function fetchData() {
-  fetch('/api/data')
-    .then(r => r.json())
-    .then(d => {
-      if (!d.metrics || d.metrics.length === 0) return;
-
-      const m = d.metrics;
-      const latest = m[m.length - 1];
-      const rewards = m.map(x => x.ep_rew_mean || 0);
-      const epLens = m.map(x => x.ep_len_mean || 0);
-      const labels = m.map(x => (x.total_timesteps / 1e6).toFixed(1));
-
-      const lossData = m.filter(x => x.loss !== undefined);
-      const lossLabels = lossData.map(x => (x.total_timesteps / 1e6).toFixed(1));
-      const losses = lossData.map(x => x.loss);
-
-      const stdData = m.filter(x => x.std !== undefined);
-      const stdLabels = stdData.map(x => (x.total_timesteps / 1e6).toFixed(1));
-      const stds = stdData.map(x => x.std);
-
-      const total = latest.total_timesteps || 0;
-      const elapsed = latest.time_elapsed || 0;
-      const fps = latest.fps || 0;
-      const bestReward = Math.max(...rewards);
-      const curReward = rewards[rewards.length - 1];
-      const curLen = epLens[epLens.length - 1];
-      const curStd = stds.length > 0 ? stds[stds.length - 1] : 0;
-      // Progressive stage info — supports both curriculum and classic modes
-      const stage = d.stage;
-      let stageNum = 1, totalStages = 1, stageTargetSteps = 50e6, currentStageName = '';
-      let globalTotalSteps = 50e6, globalDoneSteps = 0;
-      const isCurriculum = stage && stage.curriculum;
-      const curPlan = isCurriculum
-        ? (d.curricula && d.curricula[stage.curriculum]
-            ? d.curricula[stage.curriculum].stages
-            : (stage.curriculum_stages || null))
-        : null;
-
-      if (isCurriculum && curPlan) {
-        const curIdx = stage.curriculum_stage_idx || 0;
-        totalStages = curPlan.length;
-        stageNum = Math.min(curIdx + 1, totalStages);
-        globalTotalSteps = curPlan[curPlan.length - 1].target;
-        if (curIdx >= totalStages) {
-          // All stages done: lock at 100%, don't double-count
-          globalDoneSteps = globalTotalSteps;
-        } else {
-          globalDoneSteps = curIdx > 0 ? curPlan[curIdx - 1].target : 0;
-          const curStageDef = curPlan[curIdx];
-          const prevTarget = curIdx > 0 ? curPlan[curIdx - 1].target : 0;
-          stageTargetSteps = curStageDef.target - prevTarget;
-          currentStageName = curStageDef.name || '';
-        }
-      } else if (stage && stage.planned_stages && stage.stage_idx !== undefined) {
-        stageNum = stage.stage_idx + 1;
-        totalStages = stage.total_stages || 1;
-        globalTotalSteps = stage.planned_stages[stage.planned_stages.length - 1];
-        globalDoneSteps = stage.total_steps || 0;
-        if (stage.stage_idx < stage.planned_stages.length) {
-          stageTargetSteps = stage.planned_stages[stage.stage_idx] - globalDoneSteps;
-        }
-      }
-
-      function curStageCn(name) {
-        if (!name) return '';
-        const n = name.toLowerCase();
-        if (n.includes('learn')) return '基础学习';
-        if (n.includes('refine')) return '精化训练';
-        if (n.includes('forward')) return '前进训练';
-        if (n.includes('height')) return '站立训练';
-        if (n.includes('stand')) return '站立训练';
-        if (n.includes('walk')) return '走路训练';
-        return name;
-      }
-      const stageTypeCn = curStageCn(currentStageName);
-
-      // Overall progress (across all stages)
-      // For curriculum runs, prefer persisted progressive_state total_steps
-      // to avoid stale log timesteps falsely showing 100% done.
-      // If total_steps is 0 (written only at stage completion), fall back to
-      // live_progress.total_timesteps written every rollout by LiveProgressCallback.
-      const lp = d.live_progress;
-      const liveSteps = lp && lp.total_timesteps ? lp.total_timesteps : 0;
-      const stageLocalSteps = Math.min(total, Math.max(0, stageTargetSteps));
-      let globalCurrent = Math.min(globalDoneSteps + stageLocalSteps, globalTotalSteps);
-      if (isCurriculum && stage && typeof stage.total_steps === 'number') {
-        const persistedSteps = stage.total_steps || 0;
-        // Use live_progress when persisted value is 0 (training in progress, not yet written)
-        const effectiveSteps = persistedSteps > 0 ? persistedSteps
-          : (liveSteps > 0 ? globalDoneSteps + liveSteps : globalCurrent);
-        globalCurrent = Math.min(Math.max(0, effectiveSteps), globalTotalSteps);
-      }
-      const globalPct = globalTotalSteps > 0 ? (globalCurrent / globalTotalSteps * 100).toFixed(0) : 100;
-      const globalEta = fps > 0 && globalTotalSteps > globalCurrent
-        ? ((globalTotalSteps - globalCurrent) / fps / 3600).toFixed(1) : '?';
-      // Current stage progress
-      const stageLocalCurrent = isCurriculum && stage && typeof stage.total_steps === 'number'
-        ? Math.max(0, (stage.total_steps > 0 ? stage.total_steps : liveSteps > 0 ? liveSteps : total) - globalDoneSteps)
-        : total;
-      const stagePct = stageTargetSteps > 0
-        ? (Math.min(stageLocalCurrent, stageTargetSteps) / stageTargetSteps * 100).toFixed(0)
-        : 100;
-
-      // Health check: use last 20% of rewards to detect real decline vs penalty growth
-      const tail5 = rewards.slice(-Math.max(1, Math.floor(rewards.length/5)));
-      const head5 = rewards.slice(0, Math.max(1, Math.floor(rewards.length/5)));
-      const tailAvg = tail5.reduce((a,b) => a+b, 0) / tail5.length;
-      const headAvg = head5.reduce((a,b) => a+b, 0) / head5.length;
-      // Reward decline is normal after ~1.5M steps due to penalty_factor growth
-      // Only warn if decline happens early (before 50% of training)
-      const earlyDecline = (globalCurrent / globalTotalSteps < 0.5) && tailAvg < headAvg - 50;
-      const healthy = !earlyDecline && curLen > 50;
-      const isDone = isCurriculum
-        ? ((stage.curriculum_stage_idx || 0) >= totalStages)
-        : (globalCurrent >= globalTotalSteps);
-
-      // Prefer curriculum/progressive stage metrics for headline stats.
-      // This avoids mixing legacy log history with the current run summary.
-      // During training (stage.last_metrics is empty), fall back to live_progress.ep_rew_mean.
-      let displayCurReward = curReward;
-      let displayBestReward = bestReward;
-      let displayLen = curLen;
-      if (stage && stage.last_metrics) {
-        if (stage.last_metrics.reward_final !== undefined) {
-          displayCurReward = stage.last_metrics.reward_final;
-        }
-        if (stage.last_metrics.reward_best !== undefined) {
-          displayBestReward = stage.last_metrics.reward_best;
-        }
-        if (stage.last_metrics.ep_len_final !== undefined) {
-          displayLen = stage.last_metrics.ep_len_final;
-        }
-      }
-      // If stage metrics not yet available (training in progress) and live_progress exists, use it
-      if (lp && lp.ep_rew_mean !== null && lp.ep_rew_mean !== undefined) {
-        if (!stage || !stage.last_metrics || stage.last_metrics.reward_final === undefined) {
-          displayCurReward = lp.ep_rew_mean;
-        }
-      }
-
-      function cleanText(v) {
-        if (v === undefined || v === null) return '';
-        const s = String(v).trim();
-        if (!s || s === '()' || s === '[]' || s.toLowerCase() === 'none' || s.toLowerCase() === 'null') {
-          return '';
-        }
-        return s;
-      }
-      const curriculumName = isCurriculum && stage ? cleanText(stage.curriculum || '') : '';
-      // Status badge
-      const stageTag = totalStages > 1
-        ? (stageTypeCn ? stageTypeCn + ' ' + stageNum + '/' + totalStages : stageNum + '/' + totalStages)
-        : (stageTypeCn || '');
-      document.getElementById('statusBadge').className = 'status ' + (isDone ? 'done' : 'running');
-      document.getElementById('statusBadge').textContent = isDone
-        ? ('已完成' + (curriculumName ? ' · ' + curriculumName : '') + ' · 奖励 ' + displayBestReward.toFixed(0))
-        : ('训练中 ' + (stageTag ? stageTag + ' ' : '') + globalPct + '%');
-
-      // Summary text
-      let stageDesc = '';
-      if (isCurriculum && totalStages > 1) {
-        const currentStageClean = cleanText(currentStageName);
-        if (stageTypeCn || currentStageClean) {
-          const stageLabel = stageTypeCn || currentStageClean;
-          stageDesc = '<b style="color:#c084fc;">' + stageLabel + '</b>，第 ' + stageNum + '/' + totalStages + ' 阶段，';
-        } else if (curriculumName) {
-          stageDesc = '<b style="color:#c084fc;">课程 ' + curriculumName + '</b>，第 ' + stageNum + '/' + totalStages + ' 阶段，';
-        } else {
-          stageDesc = '<b style="color:#c084fc;">第 ' + stageNum + '/' + totalStages + ' 阶段</b>，';
-        }
-      } else if (totalStages > 1) {
-        stageDesc = '<b style="color:#c084fc;">第 ' + stageNum + '/' + totalStages + ' 阶段</b>，';
-      }
-      const etaText = isDone ? '' : '预计剩余 <b>' + globalEta + '</b> 小时。';
-      const healthText = isDone
-        ? (curLen > 200
-          ? ' <b style="color:#4ade80;">训练已结束，可进行验收评估。</b>'
-          : ' <b style="color:#facc15;">训练已结束，但稳定性偏弱，建议继续调参或续训。</b>')
-        : (healthy
-          ? ' <b style="color:#4ade80;">训练健康。</b>'
-          : ' <b style="color:#f87171;">早期奖励下降，可能需要检查。</b>');
-      document.getElementById('summary').innerHTML =
-        '<b style="color:#38bdf8;">训练总结：</b>' + stageDesc +
-        '进度 <b style="color:#38bdf8;">' + (globalCurrent/1e6).toFixed(1) + 'M</b> / ' + (globalTotalSteps/1e6).toFixed(0) + 'M 步（' + globalPct + '%）。' +
-        etaText +
-        '当前奖励 <b style="color:#4ade80;">' + displayCurReward.toFixed(0) + '</b>，' +
-        '历史最高 <b style="color:#facc15;">' + displayBestReward.toFixed(0) + '</b>。' +
-        '存活 <b style="color:#c084fc;">' + displayLen.toFixed(0) + '</b>/250 步。' +
-        healthText;
-
-      document.getElementById('stats').innerHTML =
-        '<div class="stat"><div class="label">整体进度</div><div class="value blue">' + (globalCurrent/1e6).toFixed(1) + 'M / ' + (globalTotalSteps/1e6).toFixed(0) + 'M</div></div>' +
-        '<div class="stat"><div class="label">当前奖励</div><div class="value green">' + displayCurReward.toFixed(0) + '</div></div>' +
-        '<div class="stat"><div class="label">最高奖励</div><div class="value yellow">' + displayBestReward.toFixed(0) + '</div></div>' +
-        '<div class="stat"><div class="label">存活步数</div><div class="value purple">' + displayLen.toFixed(0) + '/250</div></div>' +
-        '<div class="stat"><div class="label">训练速度</div><div class="value blue">' + fps.toFixed(0) + ' fps</div></div>' +
-        '<div class="stat"><div class="label">已用时间</div><div class="value">' + (elapsed/3600).toFixed(1) + 'h</div></div>';
-
-      // Training health indicators
-      const kl = latest.approx_kl || 0;
-      const clip = latest.clip_fraction || 0;
-      const lr = latest.learning_rate || 0;
-      const ev = latest.explained_variance || 0;
-
-      function healthCard(name, cn, value, hint, colorClass) {
-        return '<div class="health-card">' +
-          '<div class="h-name">' + name + '</div>' +
-          '<div class="h-cn">' + cn + '</div>' +
-          '<div class="h-val ' + colorClass + '">' + value + '</div>' +
-          '<div class="h-hint ' + colorClass + '">' + hint + '</div></div>';
-      }
-
-      const klColor = kl < 0.03 ? 'h-good' : kl < 0.05 ? 'h-warn' : 'h-bad';
-      const klHint = kl < 0.03 ? '正常：策略更新稳定' : kl < 0.05 ? '偏高：接近阈值' : '危险：策略更新过大';
-
-      const clipColor = clip < 0.2 ? 'h-good' : clip < 0.3 ? 'h-warn' : 'h-bad';
-      const clipHint = clip < 0.2 ? '正常：大部分样本有效' : clip < 0.3 ? '偏高：部分样本被裁剪' : '危险：大量样本被裁剪';
-
-      const stdColor = curStd < 0.8 ? 'h-good' : curStd < 0.95 ? 'h-warn' : 'h-bad';
-      const stdHint = curStd < 0.5 ? '收敛：动作非常精确' : curStd < 0.8 ? '正常：策略逐渐收敛' : '初期：仍在探索中';
-
-      const evColor = ev > 0.8 ? 'h-good' : ev > 0.5 ? 'h-warn' : 'h-bad';
-      const evHint = ev > 0.8 ? '优秀：价值预测准确' : ev > 0.5 ? '一般：预测有偏差' : '差：价值网络不准';
-
-      document.getElementById('health').innerHTML =
-        healthCard('approx_kl', '策略偏移度（每次更新策略变化多大，越小越稳）', kl.toFixed(4), klHint + '（无 target_kl 限制，SB3 默认）', klColor) +
-        healthCard('clip_fraction', '裁剪比例（被裁剪的样本占比，越低越好）', (clip * 100).toFixed(1) + '%', clipHint, clipColor) +
-        healthCard('learning_rate', '学习率（控制每次学习的步幅，固定值）', lr.toFixed(6), '常数学习率 3e-4（SB3 默认值）', 'h-good') +
-        healthCard('std', '探索系数（动作随机性，越低=越精确）', curStd.toFixed(3), stdHint, stdColor) +
-        healthCard('explained_variance', '预测准确度（价值网络预测奖励的准确性）', (ev * 100).toFixed(1) + '%', evHint, evColor) +
-        '';
-
-      // Render curriculum info with full stage plan
-      const curInfoEl = document.getElementById('curriculumInfo');
-      if (curInfoEl && stage && stage.curriculum) {
-        curInfoEl.style.display = '';
-        const curName = stage.curriculum;
-        const curIdx = stage.curriculum_stage_idx || 0;
-        const curTotal = stage.total_stages || 0;
-        const completedStages = stage.stages || [];
-        // Get plan from curricula definition
-        const plan = d.curricula && d.curricula[curName] ? d.curricula[curName].stages : [];
-
-        // Stage name to Chinese
-        function stageLabel(name) {
-          if (!name) return '未知';
-          const n = name.toLowerCase();
-          if (n.includes('learn')) return '基础学习';
-          if (n.includes('refine')) return '精化训练';
-          if (n.includes('forward')) return '前进训练';
-          if (n.includes('height')) return '站立训练';
-          if (n.includes('stand')) return '站立训练';
-          if (n.includes('walk')) return '走路训练';
-          return name;
-        }
-        function stageColor(name) {
-          if (!name) return '#94a3b8';
-          const n = name.toLowerCase();
-          if (n.includes('learn')) return '#38bdf8';
-          if (n.includes('refine')) return '#c084fc';
-          if (n.includes('forward')) return '#38bdf8';
-          if (n.includes('height')) return '#4ade80';
-          if (n.includes('stand')) return '#38bdf8';
-          if (n.includes('walk')) return '#4ade80';
-          return '#94a3b8';
-        }
-
-        // Title
-        const curDesc = d.curricula[curName] ? d.curricula[curName].description : curName;
-        const stageProgress = curTotal > 1
-          ? '已完成 ' + curIdx + '/' + curTotal + ' 个阶段'
-          : (curIdx >= curTotal ? '已完成' : '训练中');
-        let html = '<div style="font-size:14px;color:#c084fc;font-weight:600;margin-bottom:10px;">' +
-          '课程：' + curName + ' · ' + stageProgress +
-          '<span style="font-size:11px;color:#64748b;margin-left:8px;">(' + curDesc + ')</span></div>';
-
-        // Stage pipeline
-        html += '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">';
-        const stageList = plan.length > 0 ? plan : [];
-        const doneAllStages = curIdx >= curTotal;
-        const activeIdx = doneAllStages ? Math.max(0, curTotal - 1) : curIdx;
-        for (let i = 0; i < Math.max(stageList.length, curTotal); i++) {
-          const def = stageList[i] || {};
-          const name = def.name || (completedStages[i] ? completedStages[i].name : '阶段' + (i+1));
-          const label = stageLabel(name);
-          const color = stageColor(name);
-          const steps = def.target ? (def.target / 1e6).toFixed(0) + 'M' : '';
-          const ent = def.ent_coef !== undefined ? def.ent_coef : '';
-          const ec = def.env_config || {};
-          const hb = ec.fac_height_bonus || '';
-
-          let status, bg, border, textColor;
-          if (i === activeIdx) {
-            // Active stage (or last stage when all completed)
-            status = doneAllStages ? '✓ 已完成' : '▶ 训练中';
-            bg = '#38bdf825';
-            border = '#38bdf8';
-            textColor = '#38bdf8';
-          } else if (i < curIdx) {
-            // Completed
-            const completed = completedStages[i];
-            const healthy = completed && completed.healthy;
-            status = healthy ? '✓' : '✗';
-            bg = '#1e293b';
-            border = '#64748b';
-            textColor = '#94a3b8';
-          } else {
-            // Pending
-            status = '待训练';
-            bg = '#1e293b';
-            border = '#334155';
-            textColor = '#64748b';
-          }
-
-          html += '<div style="background:' + bg + ';border:1px solid ' + border +
-            ';border-radius:8px;padding:8px 12px;min-width:120px;text-align:center;">';
-          html += '<div style="font-size:11px;color:' + textColor + ';font-weight:600;">' +
-            label + '</div>';
-          html += '<div style="font-size:10px;color:#94a3b8;margin:2px 0;">' + name;
-          if (steps) html += ' · ' + steps + '步';
-          html += '</div>';
-          // Show key params
-          if (ent !== '') {
-            html += '<div style="font-size:9px;color:#64748b;">ent=' + ent;
-            if (hb) html += ' h_bonus=' + hb;
-            html += '</div>';
-          }
-          html += '<div style="font-size:10px;color:' + (i < curIdx ? (completedStages[i] && completedStages[i].healthy ? '#4ade80' : '#f87171') : textColor) +
-            ';margin-top:3px;font-weight:600;">' + status + '</div>';
-          // Show reward for completed stages
-          if (i < curIdx && completedStages[i]) {
-            html += '<div style="font-size:10px;color:#94a3b8;">奖励 ' +
-              completedStages[i].metrics.reward_final.toFixed(0) + '</div>';
-          }
-          html += '</div>';
-
-          // Arrow between stages
-          if (i < Math.max(stageList.length, curTotal) - 1) {
-            html += '<div style="color:#475569;font-size:16px;">→</div>';
-          }
-        }
-        html += '</div>';
-
-        curInfoEl.innerHTML = html;
-      } else if (curInfoEl) {
-        curInfoEl.style.display = 'none';
-      }
-
-      // Render fixed-direction evaluation panel
-      const fepEl = document.getElementById('fixedEvalPanel');
-      const fe = d.fixed_eval;
-      if (fepEl && fe && fe.results) {
-        fepEl.style.display = '';
-        const feTime = fe.evaluated_at ? fe.evaluated_at.replace('T', ' ') : '';
-        const feEps = fe.episodes_per_direction || 0;
-        let feHtml = '<div style="font-size:14px;color:#38bdf8;font-weight:600;margin-bottom:10px;">' +
-          '验收评估（确定性推理） ' +
-          '<span style="font-size:11px;color:#64748b;font-weight:400;">' + feTime +
-          ' · ' + feEps + '局/方向</span></div>';
-
-        const dirs = ['forward', 'backward', 'left', 'right'];
-        const dirCN = {forward:'向前', backward:'向后', left:'向左', right:'向右'};
-        const weakest = fe.weakest_direction;
-        const bestRew = Math.max(...dirs.map(d => (fe.results[d] || {}).mean_episode_reward || 0));
-
-        feHtml += '<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px;">';
-        // Sort by reward descending for display
-        const sortedDirs = dirs.slice().sort(
-          (a, b) => (fe.results[b] || {}).mean_episode_reward - (fe.results[a] || {}).mean_episode_reward
-        );
-        for (const dir of sortedDirs) {
-          const r = fe.results[dir];
-          if (!r) continue;
-          const rew = r.mean_episode_reward || 0;
-          const prog = r.median_target_progress || 0;
-          const isWeak = dir === weakest;
-          const barW = bestRew > 0 ? Math.round(rew / bestRew * 100) : 0;
-          const barColor = isWeak ? '#f87171' : '#38bdf8';
-          const flagColor = isWeak ? '#f87171' : '#4ade80';
-          const flag = isWeak ? '⚠' : '✓';
-          feHtml += '<div style="display:flex;align-items:center;gap:8px;">';
-          feHtml += '<span style="min-width:36px;font-size:13px;color:#94a3b8;">' + (dirCN[dir] || dir) + '</span>';
-          feHtml += '<div style="flex:1;background:#0f172a;border-radius:4px;height:14px;overflow:hidden;">' +
-            '<div style="width:' + barW + '%;background:' + barColor + ';height:100%;border-radius:4px;"></div></div>';
-          feHtml += '<span style="min-width:44px;font-size:13px;color:#e2e8f0;text-align:right;">' + rew.toFixed(0) + '分</span>';
-          feHtml += '<span style="min-width:70px;font-size:11px;color:#64748b;">进度 ' + prog.toFixed(5) + '</span>';
-          feHtml += '<span style="font-size:14px;color:' + flagColor + ';">' + flag + '</span>';
-          feHtml += '</div>';
-        }
-        feHtml += '</div>';
-
-        // Posture summary table
-        feHtml += '<table style="width:100%;border-collapse:collapse;margin-bottom:12px;font-size:13px;">';
-        feHtml += '<tr style="color:#64748b;font-size:11px;">' +
-          '<th style="text-align:left;padding:4px 8px;border-bottom:1px solid #334155;">方向</th>' +
-          '<th style="text-align:right;padding:4px 8px;border-bottom:1px solid #334155;">得分</th>' +
-          '<th style="text-align:right;padding:4px 8px;border-bottom:1px solid #334155;">手臂触地率</th>' +
-          '<th style="text-align:center;padding:4px 8px;border-bottom:1px solid #334155;">状态</th>' +
-          '</tr>';
-        for (const dir of sortedDirs) {
-          const r = fe.results[dir];
-          if (!r) continue;
-          const rew = r.mean_episode_reward || 0;
-          const ac = (r.arm_contact_rate || 0) * 100;
-          const isWalking = ac < 30;
-          const statusText = isWalking ? '走路姿态' : '爬行';
-          const statusColor = isWalking ? '#4ade80' : '#facc15';
-          const isWeak = dir === weakest;
-          const dirColor = isWeak ? '#f87171' : '#e2e8f0';
-          feHtml += '<tr style="border-bottom:1px solid #1e293b;">' +
-            '<td style="padding:5px 8px;color:' + dirColor + ';">' + (dirCN[dir] || dir) + '</td>' +
-            '<td style="padding:5px 8px;text-align:right;color:' + dirColor + ';font-weight:600;">' + rew.toFixed(0) + '</td>' +
-            '<td style="padding:5px 8px;text-align:right;color:#94a3b8;">' + ac.toFixed(1) + '%</td>' +
-            '<td style="padding:5px 8px;text-align:center;color:' + statusColor + ';">' + statusText + '</td>' +
-            '</tr>';
-        }
-        feHtml += '</table>';
-
-        const weakRew = (fe.results[weakest] || {}).mean_episode_reward || 0;
-        const ratio = bestRew > 0 ? (weakRew / bestRew * 100).toFixed(0) : 0;
-        feHtml += '<div style="font-size:12px;color:#f87171;margin-bottom:6px;">' +
-          '最弱方向：' + (dirCN[weakest] || weakest) + '（' + weakRew.toFixed(0) + '分，仅为最强的 ' + ratio + '%）</div>';
-
-        const rec = fe.recommendation || '';
-        feHtml += '<div style="font-size:12px;color:#94a3b8;">建议：' + rec + '</div>';
-        if (rec.startsWith('refine_')) {
-          feHtml += '<div style="font-size:11px;color:#475569;margin-top:4px;font-family:monospace;">' +
-            'python -m jprobot.training.progressive --curriculum ' + rec + ' --auto</div>';
-        }
-
-        fepEl.innerHTML = feHtml;
-      } else if (fepEl) {
-        fepEl.style.display = 'none';
-      }
-
-      // Render posture analysis
-      const postureEl = document.getElementById('posture');
-      const postureTitle = document.getElementById('postureTitle');
-      const posture = d.posture;
-      if (postureEl && posture) {
-        postureTitle.style.display = '';
-        const isWalking = posture.behavior === 'walking';
-        const behaviorColor = isWalking ? 'h-good' : 'h-warn';
-        const behaviorText = isWalking ? '走路' : '爬行';
-        const behaviorHint = isWalking ? '身体高度正常，手臂未撑地' : '身体低伏，手臂频繁触地';
-
-        const h = posture.avg_height;
-        const heightColor = h > 0.06 ? 'h-good' : h > 0.04 ? 'h-warn' : 'h-bad';
-        const heightHint = h > 0.06 ? '站立高度正常（参考：站立≈0.07m）'
-                         : h > 0.04 ? '偏低，介于爬行与站立之间'
-                         : '爬行高度（身体贴地）';
-
-        const ac = posture.arm_contact_rate * 100;
-        const acColor = ac < 20 ? 'h-good' : ac < 50 ? 'h-warn' : 'h-bad';
-        const acHint = ac < 20 ? '手臂几乎不触地，走路姿态'
-                     : ac < 50 ? '手臂偶尔触地，姿态欠佳'
-                     : '手臂频繁撑地，典型爬行';
-
-        const tilt = posture.avg_tilt_deg;
-        const tiltColor = tilt < 10 ? 'h-good' : tilt < 20 ? 'h-warn' : 'h-bad';
-        const tiltHint = tilt < 10 ? '姿态端正' : tilt < 20 ? '轻微前倾' : '明显前倾/侧倾';
-
-        const ep = posture.episodes_sampled || 0;
-        const updatedAt = posture.updated_at ? posture.updated_at.replace('T', ' ') : '';
-
-        postureEl.innerHTML =
-          healthCard('行为判断', '基于身体高度和手臂触地率综合判断', behaviorText, behaviorHint + '（样本 ' + ep + ' 局，更新 ' + updatedAt + '）', behaviorColor) +
-          healthCard('平均身体高度', '站立≈0.07m / 爬行≈0.03m', h.toFixed(4) + 'm', heightHint, heightColor) +
-          healthCard('手臂触地频率', '手臂/肘关节接触地面的步数占比', ac.toFixed(1) + '%', acHint, acColor) +
-          healthCard('平均姿态倾角', '机体 roll+pitch 综合倾斜角', tilt.toFixed(1) + '°', tiltHint, tiltColor);
-      } else if (postureTitle) {
-        postureTitle.style.display = 'none';
-      }
-
-      // Render completed stage history
-      const histEl = document.getElementById('stageHistory');
-      const histTitle = document.getElementById('stageHistoryTitle');
-      if (histEl && stage && stage.stages && stage.stages.length > 0) {
-        histTitle.style.display = '';
-        histEl.innerHTML = stage.stages.map(s => {
-          const color = s.healthy ? '#4ade80' : '#f87171';
-          const trend = s.metrics.reward_trend >= 0
-            ? '<span style="color:#4ade80;">↑' + s.metrics.reward_trend.toFixed(0) + '</span>'
-            : '<span style="color:#f87171;">↓' + Math.abs(s.metrics.reward_trend).toFixed(0) + '</span>';
-          // Detect stage type from name, then env_config
-          let typeTag = '';
-          const sn = (s.name || '').toLowerCase();
-          const tagMap = {
-            'learn': ['#38bdf8', 'Learn'], 'refine': ['#c084fc', 'Refine'],
-            'forward': ['#38bdf8', 'Forward'], 'height': ['#4ade80', 'Height'],
-            'stand': ['#38bdf8', 'Stand'], 'walk': ['#4ade80', 'Walk'],
-          };
-          for (const [key, [tc, tt]] of Object.entries(tagMap)) {
-            if (sn.includes(key)) {
-              typeTag = '<span style="display:inline-block;background:' + tc + '22;color:' + tc +
-                ';padding:1px 6px;border-radius:4px;font-size:10px;margin-left:4px;">' + tt + '</span>';
-              break;
-            }
-          }
-          return '<div style="background:#0f172a;border-radius:8px;padding:10px 16px;border:1px solid #334155;min-width:140px;">' +
-            '<div style="font-size:12px;color:#94a3b8;">' + s.name + typeTag +
-            ' <span style="color:' + color + ';">' + (s.healthy ? '✓' : '✗') + '</span></div>' +
-            '<div style="font-size:24px;font-weight:700;color:#4ade80;margin:4px 0;">' + s.metrics.reward_final.toFixed(0) + '</div>' +
-            '<div style="font-size:11px;color:#64748b;">趋势 ' + trend + ' · ep_len ' + s.metrics.ep_len_final.toFixed(0) + '</div>' +
-            '<div style="font-size:11px;color:#475569;margin-top:4px;">' + s.completed_at.replace('T', ' ') + '</div>' +
-            '</div>';
-        }).join('');
-      } else if (histTitle) {
-        histTitle.style.display = 'none';
-      }
-
-      updateChart(charts.reward, labels, rewards);
-      updateChart(charts.len, labels, epLens);
-      updateChart(charts.loss, lossLabels, losses);
-      updateChart(charts.std, stdLabels, stds);
-
-      // Render posture trend charts
-      const ph = d.posture_history;
-      const trendTitle = document.getElementById('postureTrendTitle');
-      const trendCharts = document.getElementById('postureTrendCharts');
-      if (ph && ph.length > 0 && trendTitle && trendCharts) {
-        trendTitle.style.display = '';
-        trendCharts.style.display = '';
-        // Downsample to max 200 points for performance
-        const maxPts = 200;
-        const stride = Math.max(1, Math.floor(ph.length / maxPts));
-        const sampled = ph.filter((_, i) => i % stride === 0);
-        const phLabels = sampled.map(p => (p.step / 1e6).toFixed(1));
-        const heights = sampled.map(p => p.h);
-        const armContacts = sampled.map(p => p.ac * 100);
-        updateChart(charts.height, phLabels, heights);
-        updateChart(charts.armContact, phLabels, armContacts);
-      } else if (trendTitle) {
-        trendTitle.style.display = 'none';
-        if (trendCharts) trendCharts.style.display = 'none';
-      }
-
-      document.getElementById('lastUpdate').textContent = '更新于 ' + new Date().toLocaleTimeString();
-    })
-    .catch(e => console.error('Fetch error:', e));
-}
-
-initCharts();
 fetchData();
-setInterval(fetchData, 15000);
+setInterval(fetchData, 10000);
 </script>
 </body>
 </html>"""
@@ -1180,6 +770,7 @@ VISUALIZATION_HTML = r"""<!DOCTYPE html>
   <div><span class="label">Distance: </span><span class="val yellow" id="sDistance">-</span></div>
   <div><span class="label">Speed: </span><span class="val" id="sSpeed">-</span></div>
   <div><span class="label">Model: </span><span class="val" id="sModel">-</span></div>
+  <div id="sMoeRow" style="display:none;"><span class="label">Expert: </span><span class="val" id="sMoeExpert" style="font-weight:600;">-</span></div>
 </div>
 
 <div id="controls">
@@ -1724,6 +1315,19 @@ function connectSSE() {
     currentStep = 0; totalReward = 0; maxDistance = 0; prevX = 0; speed = 0;
     resetTrail();
     document.getElementById('sEpisode').textContent = currentEpisode;
+    // MoE mode: show which expert and direction
+    const moeRow = document.getElementById('sMoeRow');
+    const moeExpert = document.getElementById('sMoeExpert');
+    if (d.model_used && moeRow && moeExpert) {
+      moeRow.style.display = '';
+      const dirCN = {forward:'向前', backward:'向后', left:'向左', right:'向右'};
+      const cn = dirCN[d.direction] || d.direction || '';
+      const color = d.model_used === 'A' ? '#4ade80' : '#38bdf8';
+      moeExpert.style.color = color;
+      moeExpert.textContent = '[' + d.model_used + '] ' + cn;
+    } else if (moeRow) {
+      moeRow.style.display = 'none';
+    }
   });
 
   evtSource.addEventListener('frame', e => {
@@ -1896,8 +1500,14 @@ fetch('/api/viz/snapshots')
     list.forEach(name => {
       const opt = document.createElement('option');
       opt.value = name;
-      opt.textContent = name === '__latest__' ? '\u25cf \u5b9e\u65f6 (\u6700\u65b0\u68c0\u67e5\u70b9)'
-        : name === '__timelapse__' ? '\u23f3 \u8fc7\u7a0b\u56de\u653e (\u524d\u671f\u00d73\u2192\u4e2d\u671f\u2192\u6700\u7ec8)'
+      opt.textContent = name === '__moe__'              ? '✨ MoE 融合（A前进 + B后退/侧移）'
+        : name === '__route_a__'          ? '🟢 Route A v3（前进最强）'
+        : name === '__route_b__'          ? '🟦 Route B v4（多方向稳定）'
+        : name === '__backflip_jump__'    ? '🔴 Backflip — 起跳阶段'
+        : name === '__backflip_rotate__'  ? '🟠 Backflip — 旋转阶段'
+        : name === '__backflip_land__'    ? '🟡 Backflip — 落地阶段'
+        : name === '__backflip_full__'    ? '⚡ Backflip — 完整后空翻'
+        : name === '__latest__'           ? '● 实时（训练中）'
         : name;
       sel.appendChild(opt);
     });
@@ -1928,29 +1538,44 @@ connectSSE();
 
 
 def _list_snapshots(trained_dir):
-    """List available model snapshots for visualization."""
-    snapshots = ["__latest__"]  # live/latest always first
-    snap_dir = os.path.join(trained_dir, "snapshots")
+    """List meaningful model options for visualization.
+
+    训练结束后语义清晰的三档：
+      __moe__      ✨ MoE 融合（Route A 向前 + Route B 多方向）
+      __route_a__  Route A v3 best（向前最强，direction-reward）
+      __route_b__  Route B v4 best（多方向稳定，velocity-tracking）
+
+    只在有对应文件时显示，避免噪音。
+    training 进行中额外提供 __latest__（实时跟随最新 checkpoint）。
+    """
+    base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+    snapshots = []
+
+    # 1. MoE — 最推荐，排第一
+    if os.path.exists(os.path.abspath(MOE_EVAL)):
+        snapshots.append("__moe__")
+
+    # 2. Route A v3 best（向前最强）
+    route_a_best = os.path.join(base, "route_a_v3", "snapshots", "best.zip")
+    if os.path.exists(route_a_best):
+        snapshots.append("__route_a__")
+
+    # 3. Route B v4 best（多方向稳定）
+    route_b_best = os.path.join(base, "route_b_v4", "snapshots", "best.zip")
+    if os.path.exists(route_b_best):
+        snapshots.append("__route_b__")
+
+    # 4. Backflip 各阶段（有 best.zip 才显示）
+    bf_labels = {"jump": "起跳", "rotate": "旋转", "land": "落地", "full": "完整"}
+    for bf_stage in ("full", "land", "rotate", "jump"):
+        bf_best = os.path.join(base, "backflip", bf_stage, "best.zip")
+        if os.path.exists(bf_best):
+            snapshots.append(f"__backflip_{bf_stage}__")
+
+    # 5. 实时（仅当 checkpoints/ 非空时显示，表示训练正在进行）
     ckpt_dir = os.path.join(trained_dir, "checkpoints")
-
-    # best.zip second
-    if os.path.exists(os.path.join(snap_dir, "best.zip")):
-        snapshots.append("best.zip")
-
-    # Timelapse option (auto-picks early / mid / late snapshots)
-    snapshots.append("__timelapse__")
-
-    # stage snapshots
-    if os.path.isdir(snap_dir):
-        for f in sorted(os.listdir(snap_dir)):
-            if f.endswith(".zip") and f != "best.zip" and f not in snapshots:
-                snapshots.append(f)
-
-    # checkpoints
-    if os.path.isdir(ckpt_dir):
-        for f in sorted(os.listdir(ckpt_dir)):
-            if f.endswith(".zip"):
-                snapshots.append(f)
+    if os.path.isdir(ckpt_dir) and any(f.endswith(".zip") for f in os.listdir(ckpt_dir)):
+        snapshots.append("__latest__")
 
     return snapshots
 
@@ -2030,7 +1655,6 @@ def _pick_timelapse_models(trained_dir):
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    log_file = DEFAULT_LOG
     trained_dir = os.path.join(os.path.dirname(__file__), "..", "trained")
 
     def do_GET(self):
@@ -2041,22 +1665,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(DASHBOARD_HTML.encode("utf-8"))
 
         elif self.path == "/api/data":
-            metrics = parse_training_log(self.log_file)
-            stage = parse_progressive_state()
-            posture = parse_posture_eval()
-            posture_history = parse_posture_history()
-            curricula = get_curriculum_plan()
-            live_progress = parse_live_progress()
-            fixed_eval = parse_fixed_eval()
+            spec    = find_live_dashboard()
+            history = parse_history(spec) if spec else []
+            # strip internal _dir key before sending
+            if spec is not None:
+                spec = {k: v for k, v in spec.items() if k != "_dir"}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps({
-                "metrics": metrics, "stage": stage,
-                "posture": posture, "posture_history": posture_history,
-                "curricula": curricula, "live_progress": live_progress,
-                "fixed_eval": fixed_eval,
+                "spec": spec,
+                "history": history,
             }).encode("utf-8"))
 
         elif self.path == "/viz":
@@ -2189,11 +1809,22 @@ def main():
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
     parser.add_argument("--port", type=int, default=int(os.getenv("JPROBOT_DASHBOARD_PORT", "18791")))
-    parser.add_argument("--log", type=str, default=DEFAULT_LOG)
+    parser.add_argument(
+        "--run-id", type=str, default=None, dest="run_id",
+        help=(
+            "Restrict dashboard scan to trained/<run-id>/ (e.g. --run-id backflip). "
+            "Without this, scans all of trained/ for the newest live_dashboard.json."
+        ),
+    )
     args = parser.parse_args()
 
-    DashboardHandler.log_file = args.log
-    trained_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+    _base_trained = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+    if args.run_id:
+        trained_dir = os.path.join(_base_trained, args.run_id)
+        globals()["DASHBOARD_DIR"] = trained_dir
+        print(f"[Dashboard] --run-id={args.run_id!r} → scanning {trained_dir}")
+    else:
+        trained_dir = _base_trained
     DashboardHandler.trained_dir = trained_dir
 
     eval_engine = EvalEngine(trained_dir)
@@ -2201,16 +1832,12 @@ def main():
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer(("0.0.0.0", args.port), DashboardHandler)
     pid = os.getpid()
-    cmd_hint = f"conda run -n jprobot python scripts/training_server.py --port {args.port}"
     print(f"JPRobot Training Dashboard")
     print(f"  PID: {pid}")
     print(f"  Port: {args.port}")
-    print(f"  Trained dir: {trained_dir}")
+    print(f"  Dashboard scan dir: {DASHBOARD_DIR}")
     print(f"  Dashboard: http://127.0.0.1:{args.port}/dashboard")
     print(f"  3D Viz:    http://127.0.0.1:{args.port}/viz")
-    print(f"  Log: {args.log}")
-    print(f"  Recommended foreground start: {cmd_hint}")
-    print(f"  Note: If 127.0.0.1:{args.port} is not LISTEN, dashboard/viz will refuse connection.")
     print(f"  Press Ctrl+C to stop")
 
     try:
