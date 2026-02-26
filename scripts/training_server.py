@@ -24,6 +24,7 @@ from socketserver import ThreadingMixIn
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 DASHBOARD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+MOE_EVAL = os.path.join(os.path.dirname(__file__), "..", "trained", "moe_eval.json")
 
 
 def find_live_dashboard() -> dict | None:
@@ -185,14 +186,24 @@ class EvalEngine:
         if model_name == "__latest__":
             return self._find_latest_model()
         base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+        # humanoid 系列：_run_loop_humanoid 内部用 self.current_model 决定路径
         if model_name == "__route_a__":
             return os.path.join(base, "route_a_v3", "snapshots", "best.zip")
         if model_name == "__route_b__":
             return os.path.join(base, "route_b_v4", "snapshots", "best.zip")
+        if model_name == "__humanoid_v1__":
+            return os.path.join(base, "humanoid_v1", "best.zip")
+        if model_name == "__humanoid_v2__":
+            return os.path.join(base, "humanoid_v2", "best.zip")
+        if model_name == "__humanoid_v3__":
+            return os.path.join(base, "humanoid_v3", "best.zip")
+        if model_name == "__humanoid_v4__":
+            return os.path.join(base, "humanoid_v4", "best.zip")
         # Backflip 各训练阶段
-        for bf_stage in ("jump", "rotate", "land", "full"):
-            if model_name == f"__backflip_{bf_stage}__":
-                return os.path.join(base, "backflip", bf_stage, "best.zip")
+        for bf_ver, bf_dir in _list_backflip_versions(base):
+            for bf_stage in ("jump", "rotate", "land", "full"):
+                if model_name == f"__backflip_{bf_ver}_{bf_stage}__":
+                    return os.path.join(base, bf_dir, bf_stage, "best.zip")
         # Try snapshots/ first, then checkpoints/, then direct path
         for subdir in ("snapshots", "checkpoints", ""):
             path = os.path.join(self.trained_dir, subdir, model_name) if subdir else os.path.join(self.trained_dir, model_name)
@@ -203,6 +214,10 @@ class EvalEngine:
     def _run_loop(self):
         if self.current_model == "__moe__":
             self._run_loop_moe()
+            return
+
+        if self.current_model in ("__humanoid_v1__", "__humanoid_v2__", "__humanoid_v3__", "__humanoid_v4__"):
+            self._run_loop_humanoid()
             return
 
         import pybullet as p
@@ -482,6 +497,135 @@ class EvalEngine:
             self._broadcast("status", {"state": "stopped"})
 
 
+    def _run_loop_humanoid(self):
+        """人形机器人可视化：使用 MuJoCo 引擎推理。
+
+        与四足机器人的区别：
+        - 使用 mujoco.MjData 读取状态，而非 pybullet.getBasePositionAndOrientation
+        - 位姿四元数从 MuJoCo 格式 [w,x,y,z] 转成 Three.js 格式 [x,y,z,w]
+        - 帧数据中携带 robot_type='humanoid' 让前端切换渲染模式
+        """
+        # macOS MuJoCo + OpenMP 双库冲突修复（与 train_humanoid.py 保持一致）
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        import numpy as _np
+        from stable_baselines3 import PPO
+        from jprobot.training.env_humanoid import HumanoidEnv
+
+        base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+        # 根据 current_model 选择对应版本的路径和环境类
+        if self.current_model == "__humanoid_v4__":
+            model_path = os.path.join(base, "humanoid_v4", "best.zip")
+            from jprobot.training.env_humanoid_v4 import HumanoidEnvV4 as _HEnv
+        elif self.current_model == "__humanoid_v3__":
+            model_path = os.path.join(base, "humanoid_v3", "best.zip")
+            from jprobot.training.env_humanoid_v3 import HumanoidEnvV3 as _HEnv
+        elif self.current_model == "__humanoid_v2__":
+            model_path = os.path.join(base, "humanoid_v2", "best.zip")
+            from jprobot.training.env_humanoid_v2 import HumanoidEnvV2 as _HEnv
+        else:
+            model_path = os.path.join(base, "humanoid_v1", "best.zip")
+            _HEnv = HumanoidEnv
+
+        if not self._is_readable_zip(model_path):
+            self._broadcast("status", {"state": "error", "message": f"Model not found: {model_path}"})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "loading"
+        self._broadcast("status", {"state": "loading", "model": self.current_model})
+
+        try:
+            env = _HEnv(render_mode=None)
+            model = PPO.load(model_path)
+        except Exception as e:
+            self._broadcast("status", {"state": "error", "message": str(e)})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "running"
+        self._broadcast("status", {"state": "running", "model": "__humanoid_v1__"})
+
+        last_mtime = os.path.getmtime(model_path)
+        episode = 0
+
+        try:
+            while self.running:
+                episode += 1
+                obs, _ = env.reset()
+                total_reward = 0.0
+                start_x = None
+                max_distance = 0.0
+
+                self._broadcast("episode_start", {"episode": episode, "direction": "forward"})
+
+                step = 0
+                while self.running:
+                    action, _ = model.predict(obs, deterministic=True)
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    step += 1
+                    total_reward += reward
+
+                    # MuJoCo qpos: [x, y, z, w, qx, qy, qz, joint0..joint16]
+                    pos = env.data.qpos[:3].tolist()
+                    # MuJoCo 四元数格式 [w,x,y,z] → Three.js 格式 [x,y,z,w]
+                    orn_mj = env.data.qpos[3:7]
+                    orn_xyzw = [float(orn_mj[1]), float(orn_mj[2]),
+                                float(orn_mj[3]), float(orn_mj[0])]
+                    joints = [round(float(v), 4) for v in env.data.qpos[7:]]  # 17 关节角
+
+                    if start_x is None:
+                        start_x = pos[0]
+                    distance = pos[0] - start_x
+                    max_distance = max(max_distance, distance)
+
+                    self._broadcast("frame", {
+                        "step": step,
+                        "position": [round(v, 5) for v in pos],
+                        "orientation": [round(v, 5) for v in orn_xyzw],
+                        "joints": joints,
+                        "reward": round(float(reward), 2),
+                        "robot_type": "humanoid",  # 告知前端用人形渲染
+                    })
+
+                    time.sleep(0.02)
+
+                    if terminated or truncated:
+                        break
+
+                self._broadcast("episode_end", {
+                    "episode": episode,
+                    "total_reward": round(total_reward, 2),
+                    "steps": step,
+                    "survived": not terminated,
+                    "max_distance": round(max_distance, 4),
+                })
+
+                # 检查模型文件是否更新
+                try:
+                    cur_mtime = os.path.getmtime(model_path)
+                    if cur_mtime != last_mtime:
+                        last_mtime = cur_mtime
+                        model = PPO.load(model_path)
+                        self._broadcast("model_updated", {
+                            "file": "humanoid_v1/best.zip",
+                            "mtime": cur_mtime,
+                        })
+                except Exception as e:
+                    self._broadcast("status", {"state": "error", "message": str(e)})
+                    break
+
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+            self.state = "idle"
+            self.running = False
+            self._broadcast("status", {"state": "stopped"})
+
+
 # Global eval engine instance (created in main)
 eval_engine = None
 
@@ -517,8 +661,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
              gap: 12px; margin-bottom: 24px; }
   .metric-card { background: #1e293b; border-radius: 10px; padding: 14px; text-align: center; }
-  .metric-card .m-label { font-size: 12px; color: #94a3b8; }
-  .metric-card .m-value { font-size: 26px; font-weight: 700; margin-top: 4px; }
+  .metric-card .m-label { font-size: 13px; font-weight: 600; color: #cbd5e1; letter-spacing: 0.3px; }
+  .metric-card .m-sublabel { font-size: 10px; color: #64748b; margin-top: 2px; }
+  .metric-card .m-value { font-size: 26px; font-weight: 700; margin-top: 6px; }
   .color-green  { color: #4ade80; }
   .color-blue   { color: #38bdf8; }
   .color-yellow { color: #facc15; }
@@ -542,7 +687,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="top-bar">
   <div>
     <h1 id="pageTitle">JPRobot 训练面板</h1>
-    <div class="subtitle" id="pageSubtitle">加载中...</div>
+    <div class="subtitle" id="pageSubtitle"></div>
   </div>
   <a class="viz-link" href="/viz">3D 可视化 →</a>
 </div>
@@ -630,6 +775,7 @@ function renderSpec(spec) {
     card.className = 'metric-card';
     card.innerHTML = `
       <div class="m-label">${m.label}</div>
+      ${m.sublabel ? `<div class="m-sublabel">${m.sublabel}</div>` : ''}
       <div class="m-value ${colorClass(m.color)}">${m.value}</div>
     `;
     mg.appendChild(card);
@@ -688,6 +834,7 @@ async function fetchData() {
     const hasData = d.spec && d.spec.title;
     document.getElementById('noData').style.display      = hasData ? 'none'  : 'block';
     document.getElementById('mainContent').style.display = hasData ? 'block' : 'none';
+    document.getElementById('pageSubtitle').textContent  = hasData ? (d.spec.run_id || '') : '';
 
     if (hasData) {
       renderSpec(d.spec);
@@ -779,6 +926,7 @@ VISUALIZATION_HTML = r"""<!DOCTYPE html>
   <button id="startBtn" onclick="doControl('start')">开始</button>
   <button id="foxBtn" onclick="toggleFoxMode()" style="background:#0f766e;border-color:#0f766e;margin-top:4px;font-size:12px;">🦊 Fox 模型</button>
   <button id="simpleBtn" onclick="toggleSimpleMode()" style="background:#334155;border-color:#475569;margin-top:4px;font-size:12px;">⬛ 简化</button>
+  <button id="humanoidBtn" onclick="toggleHumanoidMode()" style="background:#7c3aed;border-color:#6d28d9;margin-top:4px;font-size:12px;">🚶 人形模型</button>
 </div>
 
 <div id="connStatus">未连接</div>
@@ -1157,6 +1305,174 @@ const simpleJointMap = [
   { pivot: smLegs.BL.elbowPivot,    prop: 'y' },
 ];
 
+// ─── Humanoid Robot Group（人形棍人，MuJoCo Z-up）────────────
+// Position = pelvis/root center（MuJoCo qpos[0:3]）。
+// 所有偏移量相对 pelvis 中心（z=0 = 骨盆）。
+// 人形机器人站立时 pelvis z ≈ 0.93m，头顶约在 z=1.7m。
+const humanoidGroup = new THREE.Group();
+humanoidGroup.visible = false;
+scene.add(humanoidGroup);
+
+const matHBody  = new THREE.MeshToonMaterial({ color: 0x3b6fd4 });
+const matHLimb  = new THREE.MeshToonMaterial({ color: 0x2a5bc0 });
+const matHHead  = new THREE.MeshToonMaterial({ color: 0xe8c49a });
+const matHJoint = new THREE.MeshToonMaterial({ color: 0x1a4aaa });
+
+// 辅助函数：生成沿 Z 轴方向的圆柱（CylinderGeometry 默认沿 Y，旋转 90° 对齐 Z）
+function _hCyl(r, h, mat) {
+  const g = new THREE.CylinderGeometry(r, r, h, 8);
+  const m = new THREE.Mesh(g, mat);
+  m.rotation.x = Math.PI / 2;
+  m.castShadow = true;
+  return m;
+}
+function _hSphere(r, mat) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(r, 10, 8), mat);
+  m.castShadow = true;
+  return m;
+}
+
+// 身体躯干（pelvis 向上 0→0.32m）
+const hTorsoLow = _hCyl(0.11, 0.20, matHBody);
+hTorsoLow.position.set(0, 0, 0.10);
+humanoidGroup.add(hTorsoLow);
+
+const hTorsoUp = _hCyl(0.09, 0.18, matHBody);
+hTorsoUp.position.set(0, 0, 0.29);
+humanoidGroup.add(hTorsoUp);
+
+// 颈部
+const hNeck = _hCyl(0.04, 0.10, matHBody);
+hNeck.position.set(0, 0, 0.43);
+humanoidGroup.add(hNeck);
+
+// 头部（球，z=0.58m）
+const hHead = _hSphere(0.12, matHHead);
+hHead.position.set(0, 0, 0.62);
+humanoidGroup.add(hHead);
+
+// 骨盆（pelvis 向下 z= -0.06）
+const hPelvis = _hCyl(0.13, 0.12, matHBody);
+hPelvis.position.set(0, 0, -0.06);
+humanoidGroup.add(hPelvis);
+
+// ── 腰部 pivot（abdomen 3 自由度）─────────────────────────────
+// 腰部关节位于 z=+0.12（骨盆正上方）
+const hWaistPivot = new THREE.Group();
+hWaistPivot.position.set(0, 0, 0.12);
+humanoidGroup.add(hWaistPivot);
+
+// ── 右腿（Y 轴负方向 = 右）──────────────────────────────────
+const hRHipPivot = new THREE.Group();
+hRHipPivot.position.set(0, -0.09, -0.04);
+humanoidGroup.add(hRHipPivot);
+
+const hRThigh = _hCyl(0.06, 0.35, matHLimb);
+hRThigh.position.set(0, 0, -0.175);
+hRHipPivot.add(hRThigh);
+hRHipPivot.add((() => { const b = _hSphere(0.07, matHJoint); b.position.set(0,0,0); return b; })());
+
+const hRKneePivot = new THREE.Group();
+hRKneePivot.position.set(0, 0, -0.35);
+hRHipPivot.add(hRKneePivot);
+
+const hRShin = _hCyl(0.05, 0.30, matHLimb);
+hRShin.position.set(0, 0, -0.15);
+hRKneePivot.add(hRShin);
+hRKneePivot.add((() => { const b = _hSphere(0.055, matHJoint); b.position.set(0,0,0); return b; })());
+
+const hRFoot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.09, 0.07), matHJoint);
+hRFoot.position.set(0.06, 0, -0.33);
+hRKneePivot.add(hRFoot);
+
+// ── 左腿（Y 轴正方向 = 左）──────────────────────────────────
+const hLHipPivot = new THREE.Group();
+hLHipPivot.position.set(0, 0.09, -0.04);
+humanoidGroup.add(hLHipPivot);
+
+const hLThigh = _hCyl(0.06, 0.35, matHLimb);
+hLThigh.position.set(0, 0, -0.175);
+hLHipPivot.add(hLThigh);
+hLHipPivot.add((() => { const b = _hSphere(0.07, matHJoint); b.position.set(0,0,0); return b; })());
+
+const hLKneePivot = new THREE.Group();
+hLKneePivot.position.set(0, 0, -0.35);
+hLHipPivot.add(hLKneePivot);
+
+const hLShin = _hCyl(0.05, 0.30, matHLimb);
+hLShin.position.set(0, 0, -0.15);
+hLKneePivot.add(hLShin);
+hLKneePivot.add((() => { const b = _hSphere(0.055, matHJoint); b.position.set(0,0,0); return b; })());
+
+const hLFoot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.09, 0.07), matHJoint);
+hLFoot.position.set(0.06, 0, -0.33);
+hLKneePivot.add(hLFoot);
+
+// ── 右臂（肩部在 z=+0.42，Y 轴负方向 = 右）─────────────────
+const hRShoulderPivot = new THREE.Group();
+hRShoulderPivot.position.set(0, -0.20, 0.38);
+humanoidGroup.add(hRShoulderPivot);
+
+const hRUpperArm = _hCyl(0.04, 0.27, matHLimb);
+hRUpperArm.position.set(0, 0, -0.135);
+hRShoulderPivot.add(hRUpperArm);
+hRShoulderPivot.add((() => { const b = _hSphere(0.05, matHJoint); b.position.set(0,0,0); return b; })());
+
+const hRElbowPivot = new THREE.Group();
+hRElbowPivot.position.set(0, 0, -0.27);
+hRShoulderPivot.add(hRElbowPivot);
+
+const hRForearm = _hCyl(0.033, 0.23, matHLimb);
+hRForearm.position.set(0, 0, -0.115);
+hRElbowPivot.add(hRForearm);
+hRElbowPivot.add((() => { const b = _hSphere(0.04, matHJoint); b.position.set(0,0,0); return b; })());
+
+// ── 左臂（Y 轴正方向 = 左）──────────────────────────────────
+const hLShoulderPivot = new THREE.Group();
+hLShoulderPivot.position.set(0, 0.20, 0.38);
+humanoidGroup.add(hLShoulderPivot);
+
+const hLUpperArm = _hCyl(0.04, 0.27, matHLimb);
+hLUpperArm.position.set(0, 0, -0.135);
+hLShoulderPivot.add(hLUpperArm);
+hLShoulderPivot.add((() => { const b = _hSphere(0.05, matHJoint); b.position.set(0,0,0); return b; })());
+
+const hLElbowPivot = new THREE.Group();
+hLElbowPivot.position.set(0, 0, -0.27);
+hLShoulderPivot.add(hLElbowPivot);
+
+const hLForearm = _hCyl(0.033, 0.23, matHLimb);
+hLForearm.position.set(0, 0, -0.115);
+hLElbowPivot.add(hLForearm);
+hLElbowPivot.add((() => { const b = _hSphere(0.04, matHJoint); b.position.set(0,0,0); return b; })());
+
+// 关节映射：17 个 MuJoCo 马达 → Three.js pivot + 旋转轴
+// MuJoCo actuator 顺序（与 humanoid.xml 一致）：
+//   0-2:   abdomen_y/z/x（腰部 3 DOF）
+//   3-6:   right_hip_x/z/y + right_knee
+//   7-10:  left_hip_x/z/y  + left_knee
+//   11-13: right_shoulder1/2 + right_elbow
+//   14-16: left_shoulder1/2  + left_elbow
+const humanoidJointMap = [
+  { pivot: hWaistPivot,     axis: 'y' },  // 0: abdomen_y（前后弯腰）
+  { pivot: hWaistPivot,     axis: 'z' },  // 1: abdomen_z（扭腰）
+  { pivot: hWaistPivot,     axis: 'x' },  // 2: abdomen_x（侧弯）
+  { pivot: hRHipPivot,      axis: 'x' },  // 3: right_hip_x
+  { pivot: hRHipPivot,      axis: 'z' },  // 4: right_hip_z
+  { pivot: hRHipPivot,      axis: 'y' },  // 5: right_hip_y（髋部摆腿）
+  { pivot: hRKneePivot,     axis: 'x' },  // 6: right_knee（膝盖弯曲）
+  { pivot: hLHipPivot,      axis: 'x' },  // 7: left_hip_x
+  { pivot: hLHipPivot,      axis: 'z' },  // 8: left_hip_z
+  { pivot: hLHipPivot,      axis: 'y' },  // 9: left_hip_y
+  { pivot: hLKneePivot,     axis: 'x' },  // 10: left_knee
+  { pivot: hRShoulderPivot, axis: 'y' },  // 11: right_shoulder1
+  { pivot: hRShoulderPivot, axis: 'x' },  // 12: right_shoulder2
+  { pivot: hRElbowPivot,    axis: 'x' },  // 13: right_elbow
+  { pivot: hLShoulderPivot, axis: 'y' },  // 14: left_shoulder1
+  { pivot: hLShoulderPivot, axis: 'x' },  // 15: left_shoulder2
+  { pivot: hLElbowPivot,    axis: 'x' },  // 16: left_elbow
+];
+
 // ─── Fox GLB Model (Route B) ────────────────────────────────
 // Bone mapping: BittleX joint index → Fox skeleton bone name + rotation axis
 // Left side joints use axis 'x' scale +1; Right side use scale -1 (mirrored)
@@ -1210,6 +1526,7 @@ foxLoader.load('/assets/Fox.glb', (gltf) => {
 });
 
 let simpleMode = false;
+let humanoidMode = false;
 
 window.toggleFoxMode = function() {
   if (simpleMode) return;  // 简化模式下不切换
@@ -1242,6 +1559,47 @@ window.toggleSimpleMode = function() {
     btn.style.background = '#334155';
     foxBtn.style.opacity = '1';
     foxBtn.style.pointerEvents = 'auto';
+  }
+};
+
+window.toggleHumanoidMode = function() {
+  humanoidMode = !humanoidMode;
+  const btn = document.getElementById('humanoidBtn');
+  const foxBtn = document.getElementById('foxBtn');
+  const simpleBtn = document.getElementById('simpleBtn');
+
+  if (humanoidMode) {
+    // 切换到人形模式：隐藏所有四足模型，显示人形棍人
+    robotGroup.visible = false;
+    foxWrapper.visible = false;
+    simpleGroup.visible = false;
+    humanoidGroup.visible = true;
+    foxMode = false;
+    simpleMode = false;
+    btn.textContent = '🐱 退出人形';
+    btn.style.background = '#9333ea';
+    foxBtn.style.opacity = '0.35';
+    foxBtn.style.pointerEvents = 'none';
+    simpleBtn.style.opacity = '0.35';
+    simpleBtn.style.pointerEvents = 'none';
+    // 人形机器人约 1.7m 高，调远摄像机
+    camera.position.set(4, -5, 3.5);
+    controls.target.set(0, 0, 1.0);
+    controls.update();
+  } else {
+    // 退出人形模式：恢复四足模型
+    humanoidGroup.visible = false;
+    robotGroup.visible = true;
+    btn.textContent = '🚶 人形模型';
+    btn.style.background = '#7c3aed';
+    foxBtn.style.opacity = '1';
+    foxBtn.style.pointerEvents = 'auto';
+    simpleBtn.style.opacity = '1';
+    simpleBtn.style.pointerEvents = 'auto';
+    // 恢复四足摄像机（近距离）
+    camera.position.set(0.25, -0.3, 0.25);
+    controls.target.set(0, 0, 0.05);
+    controls.update();
   }
 };
 
@@ -1335,53 +1693,64 @@ function connectSSE() {
     currentStep = d.step;
     totalReward += d.reward;
 
-    // Update robot position & orientation (PyBullet: x=forward, y=left, z=up)
     const [px, py, pz] = d.position;
     const [qx, qy, qz, qw] = d.orientation;
-    robotGroup.position.set(px, py, pz);
-    robotGroup.quaternion.set(qx, qy, qz, qw);
 
-    // Fox wrapper follows same position/orientation as robot (same height as cat)
-    foxWrapper.position.set(px, py, pz);
-    foxWrapper.quaternion.set(qx, qy, qz, qw);
+    if (d.robot_type === 'humanoid') {
+      // ── 人形机器人（MuJoCo 引擎）────────────────────────────
+      // position = 骨盆质心 xyz，orientation = [qx,qy,qz,qw]（已在后端转换）
+      humanoidGroup.position.set(px, py, pz);
+      humanoidGroup.quaternion.set(qx, qy, qz, qw);
 
-    // Update joint angles (toon cat)
-    d.joints.forEach((angle, i) => {
-      if (jointMap[i]) {
-        jointMap[i].pivot.rotation[jointMap[i].prop] = angle;
+      // 把 17 个关节角度写入对应 pivot 的旋转轴
+      // 同一个 pivot 可能被多条写入（腰部 3 轴），后写的覆盖对应轴，不冲突
+      if (d.joints) d.joints.forEach((angle, i) => {
+        if (humanoidJointMap[i]) {
+          humanoidJointMap[i].pivot.rotation[humanoidJointMap[i].axis] = angle;
+        }
+      });
+
+      // 摄像机跟随（对准骨盆上方约 0.3m，即腰部高度）
+      cameraTarget.lerp(new THREE.Vector3(px, py, pz + 0.3), 0.05);
+
+    } else {
+      // ── 四足机器人（PyBullet 引擎）──────────────────────────
+      robotGroup.position.set(px, py, pz);
+      robotGroup.quaternion.set(qx, qy, qz, qw);
+
+      foxWrapper.position.set(px, py, pz);
+      foxWrapper.quaternion.set(qx, qy, qz, qw);
+
+      d.joints.forEach((angle, i) => {
+        if (jointMap[i]) jointMap[i].pivot.rotation[jointMap[i].prop] = angle;
+      });
+
+      simpleGroup.position.set(px, py, pz);
+      simpleGroup.quaternion.set(qx, qy, qz, qw);
+      d.joints.forEach((angle, i) => {
+        if (simpleJointMap[i]) simpleJointMap[i].pivot.rotation[simpleJointMap[i].prop] = angle;
+      });
+
+      // Fox Walk 动画速度：机器人爬行 0.1-0.3 m/s → timeScale 0.5-1.5
+      if (foxMode && foxWalkAction) {
+        foxWalkAction.timeScale = Math.min(2.5, Math.max(0, Math.abs(speed) * 5));
       }
-    });
 
-    // Update simple robot
-    simpleGroup.position.set(px, py, pz);
-    simpleGroup.quaternion.set(qx, qy, qz, qw);
-    d.joints.forEach((angle, i) => {
-      if (simpleJointMap[i]) {
-        simpleJointMap[i].pivot.rotation[simpleJointMap[i].prop] = angle;
-      }
-    });
-
-    // Drive Fox Walk animation speed by robot velocity
-    // Robot crawl ~0.1-0.3 m/s → timeScale ~0.5-1.5 looks natural
-    if (foxMode && foxWalkAction) {
-      foxWalkAction.timeScale = Math.min(2.5, Math.max(0, Math.abs(speed) * 5));
+      cameraTarget.lerp(new THREE.Vector3(px, py, 0.05), 0.05);
     }
 
-    // Distance & speed
+    // ── 通用：距离 / 速度 / 轨迹 / 统计 ────────────────────────
     const dist = px - (d.step === 1 ? px : 0);
     maxDistance = Math.max(maxDistance, dist);
     speed = (px - prevX) / 0.02;
     prevX = px;
 
-    // Trail (every 3 steps)
     if (d.step % 3 === 0) addTrailPoint(px, py, pz);
 
-    // Camera follow (smooth lerp)
-    cameraTarget.lerp(new THREE.Vector3(px, py, 0.05), 0.05);
     controls.target.copy(cameraTarget);
 
-    // Update stats
-    document.getElementById('sStep').textContent = currentStep + '/250';
+    const maxSteps = d.robot_type === 'humanoid' ? '1000' : '250';
+    document.getElementById('sStep').textContent = currentStep + '/' + maxSteps;
     document.getElementById('sReward').textContent = totalReward.toFixed(0);
     document.getElementById('sDistance').textContent = maxDistance.toFixed(3) + 'm';
     document.getElementById('sSpeed').textContent = speed.toFixed(3) + ' m/s';
@@ -1500,14 +1869,21 @@ fetch('/api/viz/snapshots')
     list.forEach(name => {
       const opt = document.createElement('option');
       opt.value = name;
-      opt.textContent = name === '__moe__'              ? '✨ MoE 融合（A前进 + B后退/侧移）'
-        : name === '__route_a__'          ? '🟢 Route A v3（前进最强）'
-        : name === '__route_b__'          ? '🟦 Route B v4（多方向稳定）'
-        : name === '__backflip_jump__'    ? '🔴 Backflip — 起跳阶段'
-        : name === '__backflip_rotate__'  ? '🟠 Backflip — 旋转阶段'
-        : name === '__backflip_land__'    ? '🟡 Backflip — 落地阶段'
-        : name === '__backflip_full__'    ? '⚡ Backflip — 完整后空翻'
-        : name === '__latest__'           ? '● 实时（训练中）'
+      const bfLabels = {
+        jump: '起跳', rotate: '旋转', land: '落地', full: '完整后空翻'
+      };
+      const bfIconList = ['🔵', '🟠', '🟢', '⚡', '🔴', '🟣', '🟡', '🩵'];
+      const bfIcons = v => bfIconList[(parseInt(v.slice(1)) - 1) % bfIconList.length];
+      const bfMatch = name.match(/^__backflip_(v\d+)_(\w+)__$/);
+      opt.textContent = name === '__moe__'         ? '✨ MoE 融合（A前进 + B后退/侧移）'
+        : name === '__route_a__'                  ? '🟢 Route A v3（前进最强）'
+        : name === '__route_b__'                  ? '🟦 Route B v4（多方向稳定）'
+        : name === '__humanoid_v4__'              ? '🚶 Humanoid v4（扩展观测203维）'
+        : name === '__humanoid_v3__'              ? '🚶 Humanoid v3（高度+步态）'
+        : name === '__humanoid_v2__'              ? '🚶 Humanoid v2（步态奖励）'
+        : name === '__humanoid_v1__'              ? '🚶 Humanoid v1（人形行走）'
+        : bfMatch ? `${bfIcons(bfMatch[1])} Backflip ${bfMatch[1].toUpperCase()} — ${bfLabels[bfMatch[2]] || bfMatch[2]}`
+        : name === '__latest__'                   ? '● 实时（训练中）'
         : name;
       sel.appendChild(opt);
     });
@@ -1535,6 +1911,23 @@ connectSSE();
 </script>
 </body>
 </html>"""
+
+
+def _list_backflip_versions(base):
+    """Scan trained/ for backflip_vN dirs, return [(ver_str, dir_name)] newest-first.
+
+    Handles:
+      backflip_vN  → "vN"  (N = 1, 2, 3, ...)
+      backflip     → "v2"  (legacy naming, used as fallback if backflip_v2 absent)
+    """
+    seen = {}
+    if os.path.isdir(base):
+        for name in os.listdir(base):
+            m = re.match(r'^backflip_v(\d+)$', name)
+            if m and os.path.isdir(os.path.join(base, name)):
+                n = int(m.group(1))
+                seen[n] = (n, f"v{n}", name)
+    return [(label, dirname) for _, label, dirname in sorted(seen.values(), reverse=True)]
 
 
 def _list_snapshots(trained_dir):
@@ -1565,17 +1958,18 @@ def _list_snapshots(trained_dir):
     if os.path.exists(route_b_best):
         snapshots.append("__route_b__")
 
-    # 4. Backflip 各阶段（有 best.zip 才显示）
-    bf_labels = {"jump": "起跳", "rotate": "旋转", "land": "落地", "full": "完整"}
-    for bf_stage in ("full", "land", "rotate", "jump"):
-        bf_best = os.path.join(base, "backflip", bf_stage, "best.zip")
-        if os.path.exists(bf_best):
-            snapshots.append(f"__backflip_{bf_stage}__")
+    # 4. Humanoid（人形行走，优先显示最新版本）
+    for hv in ("humanoid_v4", "humanoid_v3", "humanoid_v2", "humanoid_v1"):
+        hv_best = os.path.join(base, hv, "best.zip")
+        if os.path.exists(hv_best):
+            snapshots.append(f"__{hv}__")
 
-    # 5. 实时（仅当 checkpoints/ 非空时显示，表示训练正在进行）
-    ckpt_dir = os.path.join(trained_dir, "checkpoints")
-    if os.path.isdir(ckpt_dir) and any(f.endswith(".zip") for f in os.listdir(ckpt_dir)):
-        snapshots.append("__latest__")
+    # 5. Backflip 各版本各阶段（自动扫描 trained/ 下 backflip_vN 目录，新版优先）
+    for bf_ver, bf_dir in _list_backflip_versions(base):
+        for bf_stage in ("full", "land", "rotate", "jump"):
+            bf_best = os.path.join(base, bf_dir, bf_stage, "best.zip")
+            if os.path.exists(bf_best):
+                snapshots.append(f"__backflip_{bf_ver}_{bf_stage}__")
 
     return snapshots
 
