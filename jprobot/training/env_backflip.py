@@ -158,6 +158,17 @@ W_ANTI_ROLL   = 2.0   # 腾空防侧倒惩罚（v14 新增）：|roll| > 30° �
                        # 动机：V13 ep_len 仅 35 步（最大 120），大量 episode 提前因侧倒终止。
                        # 侧倒原因：liftoff ω=15 r/s 的快速旋转产生陀螺进动 → 机体横向翻转。
                        # 惩罚公式：max(0, |roll|-0.52) × W_ANTI_ROLL（0.52 rad = 30° 容限）
+W_POST_STAND    = 50.0  # v63 再加强：成功后站稳奖励（每步）25→50。
+                         # v62 诊断：uprightness只测pitch/roll角度，不区分"贴地趴"和"四腿站立"。
+                         # v63 成果：uprightness≈0.95但机器人是趴在地上（pitch≈0 = 水平 = 骗分！）
+                         # anti-gaming 安全：必须先完成后空翻才能触发，无法绕过。
+W_POST_HEIGHT   = 30.0  # v64 新增：成功后身体高度奖励（每步）。
+                         # 激励四腿支撑抬起身体，而非贴地趴着获得 uprightness=1.0。
+                         # height_ratio: height<0.04m(贴地)=0，≥0.10m(正常站高)=1.0，线性插值。
+                         # 30分/步×40步=1200分最大额外收益，约占总分11%，补充 uprightness 的盲区。
+                         # 合计最大: W_POST_STAND×40 + W_POST_HEIGHT×40 = 2000+1200 = 3200分。
+POST_SUCCESS_STEPS = 40  # v61：成功后额外运行N步给站稳奖励，之后才终止episode。
+                         # 物理意义：40步 × 0.0208s/步 ≈ 0.83秒（够机器人调整姿态站稳）。
 W_OVERROT     = 500.0 # v37 新增：超旋转惩罚（每步 × 超过360°的弧度量）。
                        # v36 教训：W_OVERSPIN=5（阈值8r/s）物理上不可行！
                        #   物理约束：完成286°需要≥11.5 r/s（0.235m跳高+腾空时间）。
@@ -329,6 +340,8 @@ class BittleBackflipEnv(gym.Env):
         self._max_height          = 0.0
         self._landed_after_launch = False
         self._success             = False
+        self._success_bonus_given = False  # v61：成功bonus只触发一次（post-success阶段不重复）
+        self._post_success_steps  = 0      # v61：成功后站稳阶段计数器
         self._milestones_hit         = set()
         self._prev_max_rot_airborne  = 0.0
 
@@ -572,10 +585,9 @@ class BittleBackflipEnv(gym.Env):
 
         # 5. 完成 bonus（稀疏大奖，只在完整后空翻成功时给一次）
         #    v41 新增：成功时附加直立姿态加成（W_UPRIGHTNESS_BONUS × uprightness × W_SUCCESS）。
-        #    完美直立落地 → 总奖励 = W_SUCCESS × (1 + 0.5 × 1.0) = 1500
-        #    翻倒落地     → 总奖励 = W_SUCCESS × (1 + 0.5 × ~0) ≈ 1000
-        #    差价 500 → agent 学会翻完后站稳，而非gaming低分收入流。
-        if self.training_phase == "full" and self._success:
+        #    v61 修改：加 _success_bonus_given 标志，防止 post-success 阶段重复触发。
+        if self.training_phase == "full" and self._success and not self._success_bonus_given:
+            self._success_bonus_given = True
             uprightness = math.exp(-2.0 * (pitch ** 2 + roll ** 2))
             reward += W_SUCCESS * (1.0 + W_UPRIGHTNESS_BONUS * uprightness)
             # v46 新增 / v48 升级：旋转完整度奖励（平方公式，让最后几度梯度更陡峭）。
@@ -587,6 +599,20 @@ class BittleBackflipEnv(gym.Env):
             rot_ratio = min(1.0, max(0.0, (rot_deg - 335.0) / (360.0 - 335.0)))
             rot_completeness = rot_ratio ** 2  # 平方：越接近360°梯度越陡
             reward += W_ROT_COMPLETENESS * rot_completeness
+
+        # 6. 成功后站稳阶段（v61 新增，v64 升级）：成功后继续 POST_SUCCESS_STEPS 步，激励落地后恢复直立。
+        #    v61-v63 设计：每步给 W_POST_STAND × uprightness（pitch/roll 角度奖励）。
+        #    v63 诊断：uprightness 有盲区——"平趴地上" (pitch=0) 和 "四腿站立" (pitch=0) 都得满分。
+        #    v64 修复：增加 W_POST_HEIGHT × height_ratio，奖励身体离地高度。
+        #      height_ratio = min(1, max(0, (height-0.04)/(0.10-0.04)))
+        #      0.04m = 身体贴地，0.10m = 正常站立高度，线性插值。
+        #    反 gaming 保证：仍需先完成后空翻，height 奖励无法被提前获得。
+        if self.training_phase == "full" and self._success:
+            if self._post_success_steps < POST_SUCCESS_STEPS:
+                uprightness_now = math.exp(-2.0 * (pitch ** 2 + roll ** 2))
+                height_ratio = min(1.0, max(0.0, (height - 0.04) / (0.10 - 0.04)))
+                reward += W_POST_STAND * uprightness_now + W_POST_HEIGHT * height_ratio
+                self._post_success_steps += 1
 
         # ── 终止判断 ──────────────────────────────────────────────────────
         self.step_counter += 1
@@ -601,8 +627,8 @@ class BittleBackflipEnv(gym.Env):
         if self.step_counter >= EPISODE_LENGTH:
             truncated = True
 
-        if self._success:
-            terminated = True   # 成功完成后空翻，结束 episode
+        if self._success and self._post_success_steps >= POST_SUCCESS_STEPS:
+            terminated = True   # 成功且站稳阶段（POST_SUCCESS_STEPS步）结束
 
         info = {
             "success":      self._success,

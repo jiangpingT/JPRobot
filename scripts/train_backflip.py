@@ -37,10 +37,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from jprobot.training.env_backflip import BittleBackflipEnv
 
 # ── 目录结构 ──────────────────────────────────────────────────────────────
-TRAINED_DIR     = Path(__file__).parent.parent / "trained" / "backflip_v60"
-TRAINED_DIR_V57 = Path(__file__).parent.parent / "trained" / "backflip_v57"  # V57：rotation=364.7°，rot@land=351.5°
-TRAINED_DIR_V58 = Path(__file__).parent.parent / "trained" / "backflip_v58"  # V58：rotation=369.1°，rot@land=357.4°
-TRAINED_DIR_V59 = Path(__file__).parent.parent / "trained" / "backflip_v59"  # V59：rotation=371.0°，rot@land=359.0°（距360仅1°！）
+TRAINED_DIR     = Path(__file__).parent.parent / "trained" / "backflip_v64"
+TRAINED_DIR_V63 = Path(__file__).parent.parent / "trained" / "backflip_v63"  # V63：W_POST_STAND=50，uprightness≈0.95但平趴骗分（无高度激励）
+TRAINED_DIR_V62 = Path(__file__).parent.parent / "trained" / "backflip_v62"  # V62：W_POST_STAND=25，avg uprightness≈0.75，视觉仍躺平
+TRAINED_DIR_V61 = Path(__file__).parent.parent / "trained" / "backflip_v61"  # V61：ep_len=100（post-success机制生效），但站立梯度不足
+TRAINED_DIR_V60 = Path(__file__).parent.parent / "trained" / "backflip_v60"  # V60：rotation=372.3°，rot@land=360.2°（完美落地！）
 
 # ── 课程定义 ──────────────────────────────────────────────────────────────
 # 每个阶段：(training_phase, timesteps, ent_coef)
@@ -61,17 +62,14 @@ TRAINED_DIR_V59 = Path(__file__).parent.parent / "trained" / "backflip_v59"  # V
 #   从 V43 热启（rotation=338.9°，各版本最高，最接近360°目标）。
 #   ent_coef=0.003（恢复标准，V45高探索反而退步）。
 CURRICULUM = [
-    ("full", 5_000_000, 0.006),   # v60：最后一冲！ent=0.006同配方，从V59热启，目标rot@land=360°
-                                   # V59成果🎉：rotation=371.0°，rot@land=359.0°（+1.6°！），距360仅1°！
-                                   # V59机制：ent=0.006第三次连续突破，战略性过旋转11°→落地359.0°。
-                                   # V59问题：std=0（固化），eval reward下降（6679 vs V58的8028）→过旋转W_OVERROT代价增加。
-                                   # V60策略：同ent_coef=0.006，从V59热启（359.0°基础）。
-                                   # 目标：rot@land从359.0°→360.0°（最后1°！）。
-                                   # 注意：如果过旋转继续增加（>15°），评估奖励会进一步下降，但rot@land才是真实指标。
-                                   # 终止条件：rot@land≥359.5°或连续两版没有提升时停止循环。
+    ("full", 5_000_000, 0.006),   # v64：新增 W_POST_HEIGHT=30（高度奖励），从V63热启。
+                                   # V63成果：uprightness≈0.95（body近乎水平），reward=9758（大幅提升）
+                                   # V63问题：uprightness 盲区——"平趴地上"(pitch=0)和"四腿站立"(pitch=0)都得满分
+                                   # V64修复：height_ratio=(height-0.04)/(0.10-0.04)，奖励身体离地高度
+                                   # 激励结构：平趴(height≈0)=2000分，站立(height=0.10m)=2000+1200=3200分，差价1200分
 ]
 
-STAGE_ORDER = ["full"]  # 单 full 阶段，从 V54 full/best.zip 热启动（360.3°基础）
+STAGE_ORDER = ["full"]  # 单 full 阶段，从 V63 full/best.zip 热启动
 
 
 _STAGE_LABELS = {"jump": "起跳", "rotate": "旋转", "land": "落地", "full": "完整"}
@@ -235,8 +233,8 @@ class BackflipProgressCallback(BaseCallback):
         ]
 
         spec = {
-            "title":    "后空翻训练 v60（最后1° rot@land=360° 终极冲击）",
-            "run_id":   "backflip_v60",
+            "title":    "后空翻训练 v64（高度奖励 W_POST_HEIGHT=30，解决平趴骗分）",
+            "run_id":   "backflip_v64",
             "updated_at": now_str,
             "progress": {
                 "current_steps": global_steps,
@@ -382,28 +380,26 @@ def main():
     print(f"device: cpu（MPS 对小网络反而慢 2.3×，详见 /tmp/mps_bench.py）")
 
     if args.stage == "all":
-        # v46 热启动：从 V43 full/best.zip（rotation=338.9°，各版本最高）。
-        # V45 教训：ent_coef=0.01 高探索从V41热启，反而退步到332°（比V43还低）。
-        # V46 核心修复：新奖励 W_ROT_COMPLETENESS=1000，激励旋转到360°。
-        #   V43 是当前 rotation 最高的稳定版本，从它热启可保留338.9°的旋转基础。
-        #   新奖励：286°落地额外+0，360°落地额外+1000，给agent明确的"旋转更多"梯度。
-        v59_warm = TRAINED_DIR_V59 / "full" / "best.zip"
+        # v63 热启动：从 V62 full/best.zip（W_POST_STAND=25，avg uprightness=0.75）。
+        # V62 教训：25分/步 梯度不足以克服躺平惯性，viz可见step 96仍躺平。
+        # V63 核心修复：W_POST_STAND=50（翻倍），最大额外2000分，占总奖励22%。
+        v63_warm = TRAINED_DIR_V63 / "full" / "best.zip"
         if args.resume:
             prev_model = args.resume
-        elif v59_warm.exists():
-            prev_model = v59_warm
-            print(f"[V60] full 阶段将从 V59 full/best.zip 热启动: {v59_warm}")
-            print(f"[V60] 策略：ent_coef=0.006，最后1°冲击！rot@land 359°→360°！")
+        elif v63_warm.exists():
+            prev_model = v63_warm
+            print(f"[V64] full 阶段将从 V63 full/best.zip 热启动: {v63_warm}")
+            print(f"[V64] 策略：ent_coef=0.006，W_POST_HEIGHT=30（新增高度奖励，迫使用腿撑起身体）")
         else:
             prev_model = None
-            print("[V60] 未找到 V59 full/best.zip，full 阶段从头训练")
+            print("[V64] 未找到 V63 full/best.zip，full 阶段从头训练")
 
         for stage, timesteps, ent_coef in CURRICULUM:
             best = train_stage(stage, timesteps, ent_coef, prev_model, args.envs)
             if not args.no_eval:
                 eval_stage(stage, best)
             prev_model = best
-        print("\n[V60] 完整课程训练结束！")
+        print("\n[V64] 完整课程训练结束！")
         print(f"最终模型: {TRAINED_DIR / 'full' / 'best.zip'}")
         print(f"验收报告: {TRAINED_DIR / 'full' / 'fixed_eval.json'}")
     else:

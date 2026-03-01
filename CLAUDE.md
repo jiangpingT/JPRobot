@@ -37,7 +37,13 @@
 
 ## 后空翻训练历史（backflip 专项）
 
-### 最终成果：V60 🎉 rot@land=360.2° 完美落地！（2026-03-01）
+### 最终成果 Phase 2：V64 🎉 落地后恢复站姿！（2026-03-01）
+- **路径**：`trained/backflip_v64/full/best.zip`
+- **指标**：success=100%, rotation=375.5°, rot@land=358.9°, ep_len=100, reward=10002.7
+- **训练方式**：从 V63 热启动，5M步，ent_coef=0.006，W_POST_STAND=50+W_POST_HEIGHT=30
+- **意义**：机器人在后空翻落地后，脚着地、身体水平保持（不再仰躺），部分恢复站姿
+
+### 最终成果 Phase 1：V60 🎉 rot@land=360.2° 完美落地！（2026-03-01）
 - **路径**：`trained/backflip_v60/full/best.zip`
 - **指标**：success=100%, rotation=372.3°, rot@land=360.2°, ep_len=61
 - **训练方式**：从 V59 热启动，5M步，ent_coef=0.006，W_LAND_TIMING=2000
@@ -291,6 +297,50 @@ V60: 空中峰值372.3° → 落地360.2°（差12.1°）
 
 **规律五：不同优化目标有不同 ent_coef 甜蜜点**
 旋转完整性阶段需要 0.007 打破固化；落地精确性阶段需要 0.006（0.007 反而退步）。每进入新的优化目标，都要重新搜索最优 ent_coef。
+
+---
+
+## 落地后站立优化复盘（V61-V64，2026-03-01）
+
+### 问题背景
+V60 完美落地后，发现机器人落地后仰躺不能站立。增加 post-success 站立机制。
+
+### 核心机制（V61 新增）
+```python
+# 成功后额外运行 POST_SUCCESS_STEPS 步，给站稳奖励
+if self._success and self._post_success_steps < POST_SUCCESS_STEPS:
+    uprightness_now = math.exp(-2.0 * (pitch ** 2 + roll ** 2))
+    height_ratio = min(1.0, max(0.0, (height - 0.04) / (0.10 - 0.04)))
+    reward += W_POST_STAND * uprightness_now + W_POST_HEIGHT * height_ratio
+    self._post_success_steps += 1
+# 站稳阶段结束后才终止 episode（ep_len 从61→100）
+```
+
+### 版本进化
+
+| 版本 | W_POST_STAND | W_POST_HEIGHT | avg uprightness | 视觉结果 |
+|------|-------------|--------------|-----------------|---------|
+| V61 | 10 | 0 | ~0 | 仰躺，梯度太弱 |
+| V62 | 25 | 0 | 0.75（22°倾斜） | 趴地，progress |
+| V63 | 50 | 0 | ~0.95 | 平趴骗分！uprightness盲区 |
+| V64 | 50 | 30 | ~0.95+height_ratio=0.20 | 脚着地，身体略抬起 |
+
+### 关键发现：uprightness 盲区
+`uprightness = exp(-2*(pitch²+roll²))` 只测体态角度，无法区分：
+- "四腿站立"（body在0.10m高处，pitch=0）→ uprightness=1.0 ✅
+- "趴在地上"（body在0.04m贴地，pitch=0）→ uprightness=1.0 ❌（骗分！）
+
+解法：增加 `height_ratio = (height-0.04)/(0.10-0.04)` 奖励身体离地高度。
+
+### 最终成果（V64）
+- ep_len=100±0（40步站稳阶段正常运行）
+- reward=10002.7（历史最高）
+- 脚着地、身体水平（不仰躺），body高度≈0.052m（vs目标0.10m）
+- 未完全站立（物理约束：从倒地恢复到完全站立需要更长训练）
+
+### 规律六：奖励指标盲区需要多维信号
+单一角度奖励（uprightness）被 agent 用"趴地"行为满足，需要额外的高度信号闭合盲区。
+设计站立奖励时应同时激励：角度（body水平）+ 高度（body离地）+ 脚接触（足部着地）。
 
 ---
 
