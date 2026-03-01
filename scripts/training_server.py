@@ -191,14 +191,22 @@ class EvalEngine:
             return os.path.join(base, "route_a_v3", "snapshots", "best.zip")
         if model_name == "__route_b__":
             return os.path.join(base, "route_b_v4", "snapshots", "best.zip")
-        if model_name == "__humanoid_v1__":
-            return os.path.join(base, "humanoid_v1", "best.zip")
-        if model_name == "__humanoid_v2__":
-            return os.path.join(base, "humanoid_v2", "best.zip")
-        if model_name == "__humanoid_v3__":
-            return os.path.join(base, "humanoid_v3", "best.zip")
-        if model_name == "__humanoid_v4__":
-            return os.path.join(base, "humanoid_v4", "best.zip")
+        if model_name == "__humanoid_sac__":
+            return os.path.join(base, "humanoid_sac", "best.zip")
+        if model_name == "__humanoid_velocity__":
+            return os.path.join(base, "humanoid_velocity", "best.zip")
+        if model_name == "__humanoid_upright_c2__":
+            return os.path.join(base, "humanoid_upright", "C2", "best.zip")
+        sac_ckpt_m = re.match(r'^__humanoid_sac_ckpt_(\d+)__$', model_name)
+        if sac_ckpt_m:
+            steps = sac_ckpt_m.group(1)
+            return os.path.join(base, "humanoid_sac", "checkpoints", f"humanoid_sac_{steps}_steps.zip")
+        if model_name == "__backflip_latest__":
+            versions = _list_backflip_versions(base)
+            if versions:
+                _, bf_dir = versions[0]
+                return os.path.join(base, bf_dir, "full", "best.zip")
+            return None
         # Backflip 各训练阶段
         for bf_ver, bf_dir in _list_backflip_versions(base):
             for bf_stage in ("jump", "rotate", "land", "full"):
@@ -216,8 +224,23 @@ class EvalEngine:
             self._run_loop_moe()
             return
 
-        if self.current_model in ("__humanoid_v1__", "__humanoid_v2__", "__humanoid_v3__", "__humanoid_v4__"):
-            self._run_loop_humanoid()
+        if self.current_model == "__humanoid_sac__":
+            self._run_loop_humanoid_sac()
+            return
+
+        if self.current_model == "__humanoid_velocity__":
+            self._run_loop_humanoid_velocity()
+            return
+
+        if self.current_model == "__humanoid_upright_c2__":
+            c2_path = self._resolve_model_path("__humanoid_upright_c2__")
+            self._run_loop_humanoid_sac(model_path=c2_path)
+            return
+
+        sac_ckpt_m = re.match(r'^__humanoid_sac_ckpt_(\d+)__$', self.current_model)
+        if sac_ckpt_m:
+            ckpt_path = self._resolve_model_path(self.current_model)
+            self._run_loop_humanoid_sac(model_path=ckpt_path)
             return
 
         import pybullet as p
@@ -625,6 +648,249 @@ class EvalEngine:
             self.running = False
             self._broadcast("status", {"state": "stopped"})
 
+    def _run_loop_humanoid_sac(self, model_path=None):
+        """SAC 人形机器人可视化：Gymnasium Humanoid-v4 原生环境 + SAC 策略。
+
+        model_path=None → 使用 humanoid_sac/best.zip（训练最佳，支持热加载）
+        model_path=<path> → 使用指定 checkpoint（固定模型，不热加载）
+        """
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        import gymnasium as _gym
+        from stable_baselines3 import SAC
+
+        base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+        is_live = model_path is None  # live=True 时每局结束后检查 best.zip 是否更新
+        if model_path is None:
+            model_path = os.path.join(base, "humanoid_sac", "best.zip")
+
+        if not self._is_readable_zip(model_path):
+            self._broadcast("status", {"state": "error", "message": f"Model not found: {model_path}"})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "loading"
+        self._broadcast("status", {"state": "loading", "model": "__humanoid_sac__"})
+
+        try:
+            env = _gym.make("Humanoid-v4")
+            model = SAC.load(model_path)
+        except Exception as e:
+            self._broadcast("status", {"state": "error", "message": str(e)})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "running"
+        self._broadcast("status", {"state": "running", "model": "__humanoid_sac__"})
+
+        last_mtime = os.path.getmtime(model_path)
+        episode = 0
+
+        try:
+            while self.running:
+                episode += 1
+                obs, _ = env.reset()
+                total_reward = 0.0
+                start_x = None
+                max_distance = 0.0
+
+                self._broadcast("episode_start", {"episode": episode, "direction": "forward"})
+
+                step = 0
+                while self.running:
+                    action, _ = model.predict(obs, deterministic=True)
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    step += 1
+                    total_reward += reward
+
+                    # Gymnasium Humanoid-v4 qpos: [x, y, z, w, qx, qy, qz, joint0..joint16]
+                    pos = env.unwrapped.data.qpos[:3].tolist()
+                    orn_mj = env.unwrapped.data.qpos[3:7]
+                    orn_xyzw = [float(orn_mj[1]), float(orn_mj[2]),
+                                float(orn_mj[3]), float(orn_mj[0])]
+                    joints = [round(float(v), 4) for v in env.unwrapped.data.qpos[7:]]  # 17 关节角
+
+                    if start_x is None:
+                        start_x = pos[0]
+                    distance = pos[0] - start_x
+                    max_distance = max(max_distance, distance)
+
+                    self._broadcast("frame", {
+                        "step": step,
+                        "position": [round(v, 5) for v in pos],
+                        "orientation": [round(v, 5) for v in orn_xyzw],
+                        "joints": joints,
+                        "reward": round(float(reward), 2),
+                        "robot_type": "humanoid",
+                    })
+
+                    time.sleep(0.02)
+
+                    if terminated or truncated:
+                        break
+
+                self._broadcast("episode_end", {
+                    "episode": episode,
+                    "total_reward": round(total_reward, 2),
+                    "steps": step,
+                    "survived": not terminated,
+                    "max_distance": round(max_distance, 4),
+                })
+
+                # 热加载：仅对 best.zip（live 模式）有效，checkpoint 是固定模型
+                if is_live:
+                    try:
+                        cur_mtime = os.path.getmtime(model_path)
+                        if cur_mtime != last_mtime:
+                            last_mtime = cur_mtime
+                            model = SAC.load(model_path)
+                            self._broadcast("model_updated", {
+                                "file": "humanoid_sac/best.zip",
+                                "mtime": cur_mtime,
+                            })
+                    except Exception as e:
+                        self._broadcast("status", {"state": "error", "message": str(e)})
+                        break
+
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+            self.state = "idle"
+            self.running = False
+            self._broadcast("status", {"state": "stopped"})
+
+    def _run_loop_humanoid_velocity(self):
+        """速度命令跟随人形机器人可视化：HumanoidVelocityEnv + SAC 策略。
+
+        与 _run_loop_humanoid_sac 的区别：
+          - 使用 HumanoidVelocityEnv（379维obs = 376 + 3速度命令）
+          - 每局广播 vel_cmd 和 vel_actual 供前端 HUD 显示
+          - frame 数据多了 vel_cmd/vel_actual/vel_error 字段
+        """
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        from stable_baselines3 import SAC
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from jprobot.training.env_humanoid_velocity import HumanoidVelocityEnv
+
+        base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+        model_path = os.path.join(base, "humanoid_velocity", "best.zip")
+
+        if not self._is_readable_zip(model_path):
+            self._broadcast("status", {"state": "error", "message": f"Model not found: {model_path}"})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "loading"
+        self._broadcast("status", {"state": "loading", "model": "__humanoid_velocity__"})
+
+        try:
+            env = HumanoidVelocityEnv()
+            model = SAC.load(model_path)
+        except Exception as e:
+            self._broadcast("status", {"state": "error", "message": str(e)})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "running"
+        self._broadcast("status", {"state": "running", "model": "__humanoid_velocity__"})
+
+        last_mtime = os.path.getmtime(model_path)
+        episode = 0
+
+        try:
+            while self.running:
+                episode += 1
+                obs, info = env.reset()
+                cmd_vx = env.cmd_vx
+                cmd_vy = env.cmd_vy
+                cmd_wz = env.cmd_wz
+                total_reward = 0.0
+                start_x = None
+                max_distance = 0.0
+
+                self._broadcast("episode_start", {
+                    "episode": episode,
+                    "direction": f"cmd({cmd_vx:+.2f},{cmd_vy:+.2f},{cmd_wz:+.2f})",
+                    "vel_cmd": [round(cmd_vx, 3), round(cmd_vy, 3), round(cmd_wz, 3)],
+                })
+
+                step = 0
+                while self.running:
+                    action, _ = model.predict(obs, deterministic=True)
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    step += 1
+                    total_reward += float(reward)
+
+                    pos = env.unwrapped.data.qpos[:3].tolist()
+                    orn_mj = env.unwrapped.data.qpos[3:7]
+                    orn_xyzw = [float(orn_mj[1]), float(orn_mj[2]),
+                                float(orn_mj[3]), float(orn_mj[0])]
+                    joints = [round(float(v), 4) for v in env.unwrapped.data.qpos[7:]]
+
+                    if start_x is None:
+                        start_x = pos[0]
+                    distance = pos[0] - start_x
+                    max_distance = max(max_distance, distance)
+
+                    vel_actual = info.get("vel_actual", (0.0, 0.0, 0.0))
+                    vel_error  = float(info.get("vel_error", 0.0))
+
+                    self._broadcast("frame", {
+                        "step": step,
+                        "position": [round(v, 5) for v in pos],
+                        "orientation": [round(v, 5) for v in orn_xyzw],
+                        "joints": joints,
+                        "reward": round(float(reward), 2),
+                        "robot_type": "humanoid",
+                        "vel_cmd":    [round(cmd_vx, 3), round(cmd_vy, 3), round(cmd_wz, 3)],
+                        "vel_actual": [round(float(vel_actual[0]), 3),
+                                       round(float(vel_actual[1]), 3),
+                                       round(float(vel_actual[2]), 3)],
+                        "vel_error":  round(vel_error, 4),
+                    })
+
+                    time.sleep(0.02)
+
+                    if terminated or truncated:
+                        break
+
+                self._broadcast("episode_end", {
+                    "episode": episode,
+                    "total_reward": round(total_reward, 2),
+                    "steps": step,
+                    "survived": not terminated,
+                    "max_distance": round(max_distance, 4),
+                })
+
+                # 热加载：每局结束后检查 best.zip 是否更新
+                try:
+                    cur_mtime = os.path.getmtime(model_path)
+                    if cur_mtime != last_mtime:
+                        last_mtime = cur_mtime
+                        model = SAC.load(model_path)
+                        self._broadcast("model_updated", {
+                            "file": "humanoid_velocity/best.zip",
+                            "mtime": cur_mtime,
+                        })
+                except Exception as e:
+                    self._broadcast("status", {"state": "error", "message": str(e)})
+                    break
+
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+            self.state = "idle"
+            self.running = False
+            self._broadcast("status", {"state": "stopped"})
+
 
 # Global eval engine instance (created in main)
 eval_engine = None
@@ -918,6 +1184,11 @@ VISUALIZATION_HTML = r"""<!DOCTYPE html>
   <div><span class="label">Speed: </span><span class="val" id="sSpeed">-</span></div>
   <div><span class="label">Model: </span><span class="val" id="sModel">-</span></div>
   <div id="sMoeRow" style="display:none;"><span class="label">Expert: </span><span class="val" id="sMoeExpert" style="font-weight:600;">-</span></div>
+  <div id="sVelRow" style="display:none;">
+    <div><span class="label">Cmd: </span><span class="val" id="sVelCmd" style="color:#a78bfa;">-</span></div>
+    <div><span class="label">Vel: </span><span class="val" id="sVelActual" style="color:#34d399;">-</span></div>
+    <div><span class="label">Err: </span><span class="val" id="sVelError" style="color:#fb923c;">-</span></div>
+  </div>
 </div>
 
 <div id="controls">
@@ -926,7 +1197,6 @@ VISUALIZATION_HTML = r"""<!DOCTYPE html>
   <button id="startBtn" onclick="doControl('start')">开始</button>
   <button id="foxBtn" onclick="toggleFoxMode()" style="background:#0f766e;border-color:#0f766e;margin-top:4px;font-size:12px;">🦊 Fox 模型</button>
   <button id="simpleBtn" onclick="toggleSimpleMode()" style="background:#334155;border-color:#475569;margin-top:4px;font-size:12px;">⬛ 简化</button>
-  <button id="humanoidBtn" onclick="toggleHumanoidMode()" style="background:#7c3aed;border-color:#6d28d9;margin-top:4px;font-size:12px;">🚶 人形模型</button>
 </div>
 
 <div id="connStatus">未连接</div>
@@ -955,10 +1225,10 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x3a4060);
-scene.fog = new THREE.Fog(0x3a4060, 3, 8);
+scene.fog = new THREE.Fog(0x3a4060, 8, 20);
 
 // Z-up camera (match PyBullet)
-const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 20);
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 30);
 camera.up.set(0, 0, 1);
 camera.position.set(0.25, -0.3, 0.25);
 
@@ -994,17 +1264,18 @@ fillLight.position.set(0, 0, -1);
 scene.add(fillLight);
 
 // ─── Ground plane ───────────────────────────────────────────
-const groundGeo = new THREE.PlaneGeometry(6, 2);
+// 地面和格子做成 200×200m，并跟随机器人移动，机器人跑多远都不会"飞出空间"
+const groundGeo = new THREE.PlaneGeometry(200, 200);
 const groundMat = new THREE.MeshToonMaterial({ color: 0x2e3358 });
 const ground = new THREE.Mesh(groundGeo, groundMat);
 ground.receiveShadow = true;
-ground.position.set(1.5, 0, -0.001);
+ground.position.set(0, 0, -0.001);
 scene.add(ground);
 
-// GridHelper 网格线地板
-const gridHelper = new THREE.GridHelper(6, 60, 0x6677dd, 0x4455aa);
+// GridHelper：200m 范围，每格 1m（200 格）
+const gridHelper = new THREE.GridHelper(200, 200, 0x6677dd, 0x4455aa);
 gridHelper.rotation.x = Math.PI / 2;
-gridHelper.position.set(1.5, 0, 0.001);
+gridHelper.position.set(0, 0, 0.001);
 gridHelper.material.transparent = true;
 gridHelper.material.opacity = 0.6;
 scene.add(gridHelper);
@@ -1311,23 +1582,30 @@ const simpleJointMap = [
 // 人形机器人站立时 pelvis z ≈ 0.93m，头顶约在 z=1.7m。
 const humanoidGroup = new THREE.Group();
 humanoidGroup.visible = false;
+humanoidGroup.scale.set(1.25, 1.25, 1.25);  // 放大 25%，更容易看清
 scene.add(humanoidGroup);
 
-const matHBody  = new THREE.MeshToonMaterial({ color: 0x3b6fd4 });
-const matHLimb  = new THREE.MeshToonMaterial({ color: 0x2a5bc0 });
-const matHHead  = new THREE.MeshToonMaterial({ color: 0xe8c49a });
-const matHJoint = new THREE.MeshToonMaterial({ color: 0x1a4aaa });
+// ── 人形材质：Phong 材质 = 有光影立体感，区别于卡通平面 ──────
+// 颜色方案：橙色躯干 + 电蓝肢体 + 金色关节 + 银白头部（参考 Gymnasium Humanoid 风格）
+const matHCore   = new THREE.MeshPhongMaterial({ color: 0xff5500, shininess: 70,  specular: 0x441100 });  // 躯干：亮橙
+const matHPelvis = new THREE.MeshPhongMaterial({ color: 0x334455, shininess: 40,  specular: 0x111111 });  // 骨盆：钢铁深灰
+const matHLimb   = new THREE.MeshPhongMaterial({ color: 0x0099ff, shininess: 90,  specular: 0x003366 });  // 大腿/上臂：电蓝
+const matHFore   = new THREE.MeshPhongMaterial({ color: 0x44ccff, shininess: 70,  specular: 0x003366 });  // 小腿/前臂：浅蓝
+const matHHead   = new THREE.MeshPhongMaterial({ color: 0xdde8f0, shininess: 100, specular: 0x888899 });  // 头：银白
+const matHJoint  = new THREE.MeshPhongMaterial({ color: 0xffcc00, shininess: 120, specular: 0x664400 });  // 关节球：金色
+const matHFoot   = new THREE.MeshPhongMaterial({ color: 0x445566, shininess: 50,  specular: 0x222233 });  // 脚：暗钢色
+const matHBody   = matHCore;  // 兼容旧引用
 
 // 辅助函数：生成沿 Z 轴方向的圆柱（CylinderGeometry 默认沿 Y，旋转 90° 对齐 Z）
 function _hCyl(r, h, mat) {
-  const g = new THREE.CylinderGeometry(r, r, h, 8);
+  const g = new THREE.CylinderGeometry(r, r, h, 16);  // 16 段 = 更圆滑
   const m = new THREE.Mesh(g, mat);
   m.rotation.x = Math.PI / 2;
   m.castShadow = true;
   return m;
 }
 function _hSphere(r, mat) {
-  const m = new THREE.Mesh(new THREE.SphereGeometry(r, 10, 8), mat);
+  const m = new THREE.Mesh(new THREE.SphereGeometry(r, 16, 12), mat);  // 高分辨率球
   m.castShadow = true;
   return m;
 }
@@ -1352,7 +1630,7 @@ hHead.position.set(0, 0, 0.62);
 humanoidGroup.add(hHead);
 
 // 骨盆（pelvis 向下 z= -0.06）
-const hPelvis = _hCyl(0.13, 0.12, matHBody);
+const hPelvis = _hCyl(0.13, 0.12, matHPelvis);
 hPelvis.position.set(0, 0, -0.06);
 humanoidGroup.add(hPelvis);
 
@@ -1376,12 +1654,12 @@ const hRKneePivot = new THREE.Group();
 hRKneePivot.position.set(0, 0, -0.35);
 hRHipPivot.add(hRKneePivot);
 
-const hRShin = _hCyl(0.05, 0.30, matHLimb);
+const hRShin = _hCyl(0.05, 0.30, matHFore);
 hRShin.position.set(0, 0, -0.15);
 hRKneePivot.add(hRShin);
 hRKneePivot.add((() => { const b = _hSphere(0.055, matHJoint); b.position.set(0,0,0); return b; })());
 
-const hRFoot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.09, 0.07), matHJoint);
+const hRFoot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.09, 0.07), matHFoot);
 hRFoot.position.set(0.06, 0, -0.33);
 hRKneePivot.add(hRFoot);
 
@@ -1399,12 +1677,12 @@ const hLKneePivot = new THREE.Group();
 hLKneePivot.position.set(0, 0, -0.35);
 hLHipPivot.add(hLKneePivot);
 
-const hLShin = _hCyl(0.05, 0.30, matHLimb);
+const hLShin = _hCyl(0.05, 0.30, matHFore);
 hLShin.position.set(0, 0, -0.15);
 hLKneePivot.add(hLShin);
 hLKneePivot.add((() => { const b = _hSphere(0.055, matHJoint); b.position.set(0,0,0); return b; })());
 
-const hLFoot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.09, 0.07), matHJoint);
+const hLFoot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.09, 0.07), matHFoot);
 hLFoot.position.set(0.06, 0, -0.33);
 hLKneePivot.add(hLFoot);
 
@@ -1422,7 +1700,7 @@ const hRElbowPivot = new THREE.Group();
 hRElbowPivot.position.set(0, 0, -0.27);
 hRShoulderPivot.add(hRElbowPivot);
 
-const hRForearm = _hCyl(0.033, 0.23, matHLimb);
+const hRForearm = _hCyl(0.033, 0.23, matHFore);
 hRForearm.position.set(0, 0, -0.115);
 hRElbowPivot.add(hRForearm);
 hRElbowPivot.add((() => { const b = _hSphere(0.04, matHJoint); b.position.set(0,0,0); return b; })());
@@ -1441,7 +1719,7 @@ const hLElbowPivot = new THREE.Group();
 hLElbowPivot.position.set(0, 0, -0.27);
 hLShoulderPivot.add(hLElbowPivot);
 
-const hLForearm = _hCyl(0.033, 0.23, matHLimb);
+const hLForearm = _hCyl(0.033, 0.23, matHFore);
 hLForearm.position.set(0, 0, -0.115);
 hLElbowPivot.add(hLForearm);
 hLElbowPivot.add((() => { const b = _hSphere(0.04, matHJoint); b.position.set(0,0,0); return b; })());
@@ -1562,46 +1840,6 @@ window.toggleSimpleMode = function() {
   }
 };
 
-window.toggleHumanoidMode = function() {
-  humanoidMode = !humanoidMode;
-  const btn = document.getElementById('humanoidBtn');
-  const foxBtn = document.getElementById('foxBtn');
-  const simpleBtn = document.getElementById('simpleBtn');
-
-  if (humanoidMode) {
-    // 切换到人形模式：隐藏所有四足模型，显示人形棍人
-    robotGroup.visible = false;
-    foxWrapper.visible = false;
-    simpleGroup.visible = false;
-    humanoidGroup.visible = true;
-    foxMode = false;
-    simpleMode = false;
-    btn.textContent = '🐱 退出人形';
-    btn.style.background = '#9333ea';
-    foxBtn.style.opacity = '0.35';
-    foxBtn.style.pointerEvents = 'none';
-    simpleBtn.style.opacity = '0.35';
-    simpleBtn.style.pointerEvents = 'none';
-    // 人形机器人约 1.7m 高，调远摄像机
-    camera.position.set(4, -5, 3.5);
-    controls.target.set(0, 0, 1.0);
-    controls.update();
-  } else {
-    // 退出人形模式：恢复四足模型
-    humanoidGroup.visible = false;
-    robotGroup.visible = true;
-    btn.textContent = '🚶 人形模型';
-    btn.style.background = '#7c3aed';
-    foxBtn.style.opacity = '1';
-    foxBtn.style.pointerEvents = 'auto';
-    simpleBtn.style.opacity = '1';
-    simpleBtn.style.pointerEvents = 'auto';
-    // 恢复四足摄像机（近距离）
-    camera.position.set(0.25, -0.3, 0.25);
-    controls.target.set(0, 0, 0.05);
-    controls.update();
-  }
-};
 
 // ─── Trajectory trail ───────────────────────────────────────
 const MAX_TRAIL = 2000;
@@ -1696,22 +1934,50 @@ function connectSSE() {
     const [px, py, pz] = d.position;
     const [qx, qy, qz, qw] = d.orientation;
 
+    // ── 自动切换显示模式（无需手动点按钮）──────────────────────
+    // 每次首帧检测到 robot_type 变化就自动同步，和四足完全一致的体验
+    const isHumanoidFrame = d.robot_type === 'humanoid';
+    if (isHumanoidFrame && !humanoidMode) {
+      // 收到人形数据 → 自动进入人形模式
+      humanoidMode = true;
+      humanoidGroup.visible = true;
+      robotGroup.visible = false;
+      foxWrapper.visible = false;
+      simpleGroup.visible = false;
+      camera.position.set(2.5, -3.5, 2.5);
+      controls.target.set(0, 0, 1.0);
+      controls.update();
+    } else if (!isHumanoidFrame && humanoidMode) {
+      // 收到四足数据 → 自动退出人形模式
+      humanoidMode = false;
+      humanoidGroup.visible = false;
+      robotGroup.visible = !foxMode && !simpleMode;
+      foxWrapper.visible = foxMode && !simpleMode;
+      simpleGroup.visible = simpleMode;
+      camera.position.set(0.25, -0.3, 0.25);
+      controls.target.set(0, 0, 0.05);
+      controls.update();
+    }
+
     if (d.robot_type === 'humanoid') {
       // ── 人形机器人（MuJoCo 引擎）────────────────────────────
-      // position = 骨盆质心 xyz，orientation = [qx,qy,qz,qw]（已在后端转换）
-      humanoidGroup.position.set(px, py, pz);
+      // MuJoCo qpos[:3] = torso（根体）位置。我们的 Three.js 几何体以 pelvis 为原点，
+      // 脚底在 group local z ≈ -0.755。MuJoCo 的腿更长（≈1.32m），
+      // 差值 ≈ 0.64m，用常量 H_GND 补偿，让脚尽量踩到地面。
+      const H_GND = 0.64;
+      humanoidGroup.position.set(px, py, pz - H_GND);
       humanoidGroup.quaternion.set(qx, qy, qz, qw);
 
       // 把 17 个关节角度写入对应 pivot 的旋转轴
-      // 同一个 pivot 可能被多条写入（腰部 3 轴），后写的覆盖对应轴，不冲突
       if (d.joints) d.joints.forEach((angle, i) => {
         if (humanoidJointMap[i]) {
           humanoidJointMap[i].pivot.rotation[humanoidJointMap[i].axis] = angle;
         }
       });
 
-      // 摄像机跟随（对准骨盆上方约 0.3m，即腰部高度）
-      cameraTarget.lerp(new THREE.Vector3(px, py, pz + 0.3), 0.05);
+      // 相机跟随：和四足一样用 controls.target，目标对准腰部高度
+      // OrbitControls 会自动保持相机与目标的相对位置，不需要单独移动 camera.position
+      cameraTarget.lerp(new THREE.Vector3(px, py, pz - H_GND + 0.7), 0.05);
 
     } else {
       // ── 四足机器人（PyBullet 引擎）──────────────────────────
@@ -1749,11 +2015,33 @@ function connectSSE() {
 
     controls.target.copy(cameraTarget);
 
+    // 地面跟随机器人，保证机器人始终在地面中央（0.1 平滑追踪）
+    ground.position.x    += (px - ground.position.x)    * 0.1;
+    ground.position.y    += (py - ground.position.y)    * 0.1;
+    gridHelper.position.x += (px - gridHelper.position.x) * 0.1;
+    gridHelper.position.y += (py - gridHelper.position.y) * 0.1;
+
     const maxSteps = d.robot_type === 'humanoid' ? '1000' : '250';
     document.getElementById('sStep').textContent = currentStep + '/' + maxSteps;
     document.getElementById('sReward').textContent = totalReward.toFixed(0);
     document.getElementById('sDistance').textContent = maxDistance.toFixed(3) + 'm';
     document.getElementById('sSpeed').textContent = speed.toFixed(3) + ' m/s';
+
+    // 速度命令 HUD（仅速度跟随模式显示）
+    const velRow = document.getElementById('sVelRow');
+    if (d.vel_cmd) {
+      velRow.style.display = '';
+      const c = d.vel_cmd;
+      const a = d.vel_actual || [0,0,0];
+      document.getElementById('sVelCmd').textContent =
+        `vx${c[0]>=0?'+':''}${c[0].toFixed(2)} vy${c[1]>=0?'+':''}${c[1].toFixed(2)} wz${c[2]>=0?'+':''}${c[2].toFixed(2)}`;
+      document.getElementById('sVelActual').textContent =
+        `vx${a[0]>=0?'+':''}${a[0].toFixed(2)} vy${a[1]>=0?'+':''}${a[1].toFixed(2)} wz${a[2]>=0?'+':''}${a[2].toFixed(2)}`;
+      const err = d.vel_error !== undefined ? d.vel_error : null;
+      document.getElementById('sVelError').textContent = err !== null ? err.toFixed(4) : '-';
+    } else {
+      velRow.style.display = 'none';
+    }
   });
 
   evtSource.addEventListener('episode_end', e => {
@@ -1828,6 +2116,30 @@ window.doControl = function(action) {
   if (action === 'start') {
     timelapseQueue = [];
     body.model = model;
+
+    // 点击"开始"时自动切换模式：
+    // - 选了人形模型 → 自动进入 humanoidMode
+    // - 选了非人形模型但当前在 humanoidMode → 自动退出，无需手动点"退出人形"
+    const isHumanoidModel = model && model.toLowerCase().includes('humanoid');
+    if (isHumanoidModel && !humanoidMode) {
+      humanoidMode = true;
+      humanoidGroup.visible = true;
+      robotGroup.visible = false;
+      foxWrapper.visible = false;
+      simpleGroup.visible = false;
+      camera.position.set(2.5, -3.5, 2.5);
+      controls.target.set(0, 0, 1.0);
+      controls.update();
+    } else if (!isHumanoidModel && humanoidMode) {
+      humanoidMode = false;
+      humanoidGroup.visible = false;
+      robotGroup.visible = !foxMode && !simpleMode;
+      foxWrapper.visible = foxMode && !simpleMode;
+      simpleGroup.visible = simpleMode;
+      camera.position.set(0.25, -0.3, 0.25);
+      controls.target.set(0, 0, 0.05);
+      controls.update();
+    }
   }
   fetch('/api/viz/control', {
     method: 'POST',
@@ -1875,15 +2187,17 @@ fetch('/api/viz/snapshots')
       const bfIconList = ['🔵', '🟠', '🟢', '⚡', '🔴', '🟣', '🟡', '🩵'];
       const bfIcons = v => bfIconList[(parseInt(v.slice(1)) - 1) % bfIconList.length];
       const bfMatch = name.match(/^__backflip_(v\d+)_(\w+)__$/);
-      opt.textContent = name === '__moe__'         ? '✨ MoE 融合（A前进 + B后退/侧移）'
-        : name === '__route_a__'                  ? '🟢 Route A v3（前进最强）'
-        : name === '__route_b__'                  ? '🟦 Route B v4（多方向稳定）'
-        : name === '__humanoid_v4__'              ? '🚶 Humanoid v4（扩展观测203维）'
-        : name === '__humanoid_v3__'              ? '🚶 Humanoid v3（高度+步态）'
-        : name === '__humanoid_v2__'              ? '🚶 Humanoid v2（步态奖励）'
-        : name === '__humanoid_v1__'              ? '🚶 Humanoid v1（人形行走）'
+      const sacCkptMatch = name.match(/^__humanoid_sac_ckpt_(\d+)__$/);
+      opt.textContent = name === '__moe__'                  ? '✨ MoE 融合（A前进 + B后退/侧移）'
+        : name === '__route_a__'                           ? '🟢 Route A v3（前进最强）'
+        : name === '__route_b__'                           ? '🟦 Route B v4（多方向稳定）'
+        : name === '__humanoid_upright_c2__'               ? '🧍 Humanoid 直立 C2（软奖励直立版）'
+        : name === '__humanoid_velocity__'                 ? '🏃 Humanoid 万向行走（速度命令跟随）'
+        : name === '__humanoid_sac__'                      ? '🚶 Humanoid SAC — best（弯腰基线版）'
+        : name === '__backflip_latest__'                   ? '🤸 Backflip — best（最新最佳）'
+        : sacCkptMatch ? `🚶 Humanoid SAC — ${(parseInt(sacCkptMatch[1])/1e6).toFixed(1)}M 步快照`
         : bfMatch ? `${bfIcons(bfMatch[1])} Backflip ${bfMatch[1].toUpperCase()} — ${bfLabels[bfMatch[2]] || bfMatch[2]}`
-        : name === '__latest__'                   ? '● 实时（训练中）'
+        : name === '__latest__'                     ? '● 实时（训练中）'
         : name;
       sel.appendChild(opt);
     });
@@ -1958,18 +2272,58 @@ def _list_snapshots(trained_dir):
     if os.path.exists(route_b_best):
         snapshots.append("__route_b__")
 
-    # 4. Humanoid（人形行走，优先显示最新版本）
-    for hv in ("humanoid_v4", "humanoid_v3", "humanoid_v2", "humanoid_v1"):
-        hv_best = os.path.join(base, hv, "best.zip")
-        if os.path.exists(hv_best):
-            snapshots.append(f"__{hv}__")
+    # 4. 固定置顶：人形机器人模型（不参与时间混排）
+    # C2 直立版（更新，排前面）
+    c2_best = os.path.join(base, "humanoid_upright", "C2", "best.zip")
+    if os.path.exists(c2_best):
+        snapshots.append("__humanoid_upright_c2__")
 
-    # 5. Backflip 各版本各阶段（自动扫描 trained/ 下 backflip_vN 目录，新版优先）
-    for bf_ver, bf_dir in _list_backflip_versions(base):
+    # 速度命令跟随版（万向行走，379维obs）
+    vel_best = os.path.join(base, "humanoid_velocity", "best.zip")
+    if os.path.exists(vel_best):
+        snapshots.append("__humanoid_velocity__")
+
+    sac_best = os.path.join(base, "humanoid_sac", "best.zip")
+    if os.path.exists(sac_best):
+        snapshots.append("__humanoid_sac__")
+
+    bf_versions = _list_backflip_versions(base)
+    if bf_versions:
+        _bf_latest_ver, _bf_latest_dir = bf_versions[0]
+        bf_latest_path = os.path.join(base, _bf_latest_dir, "full", "best.zip")
+        if os.path.exists(bf_latest_path):
+            snapshots.append("__backflip_latest__")
+
+    # 5. 时间混排：Humanoid SAC checkpoints + Backflip 各版本各阶段（最新在前）
+    timed = []  # [(mtime, token)]
+
+    # Humanoid SAC checkpoints（不含 best.zip，已置顶）
+    sac_ckpt_dir = os.path.join(base, "humanoid_sac", "checkpoints")
+    if os.path.isdir(sac_ckpt_dir):
+        for fname in os.listdir(sac_ckpt_dir):
+            m = re.match(r'^humanoid_sac_(\d+)_steps\.zip$', fname)
+            if m:
+                steps = int(m.group(1))
+                fpath = os.path.join(sac_ckpt_dir, fname)
+                try:
+                    mt = os.path.getmtime(fpath)
+                except OSError:
+                    mt = 0
+                timed.append((mt, f"__humanoid_sac_ckpt_{steps}__"))
+
+    # Backflip 各版本各阶段（不含 best，已置顶）
+    for bf_ver, bf_dir in bf_versions:
         for bf_stage in ("full", "land", "rotate", "jump"):
             bf_best = os.path.join(base, bf_dir, bf_stage, "best.zip")
             if os.path.exists(bf_best):
-                snapshots.append(f"__backflip_{bf_ver}_{bf_stage}__")
+                try:
+                    mt = os.path.getmtime(bf_best)
+                except OSError:
+                    mt = 0
+                timed.append((mt, f"__backflip_{bf_ver}_{bf_stage}__"))
+
+    timed.sort(key=lambda x: x[0], reverse=True)
+    snapshots.extend(token for _, token in timed)
 
     return snapshots
 

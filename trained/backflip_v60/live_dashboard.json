@@ -1,0 +1,69 @@
+{
+  "title": "后空翻训练 v60（最后1° rot@land=360° 终极冲击）",
+  "run_id": "backflip_v60",
+  "updated_at": "2026-03-01T14:37:29",
+  "progress": {
+    "current_steps": 5000000,
+    "total_steps": 5000000
+  },
+  "stages": [
+    {
+      "name": "full",
+      "label": "完整",
+      "done": true,
+      "reward": 7705.4,
+      "note": "rot=372.3°"
+    }
+  ],
+  "metrics": [
+    {
+      "label": "Reward",
+      "sublabel": "当前奖励",
+      "value": 4476.8,
+      "color": "green"
+    },
+    {
+      "label": "ep_len",
+      "sublabel": "每局步数",
+      "value": 53.0,
+      "color": "orange"
+    },
+    {
+      "label": "Rotation",
+      "sublabel": "旋转角度",
+      "value": "372.3°",
+      "color": "blue"
+    },
+    {
+      "label": "Height",
+      "sublabel": "腾空高度",
+      "value": "0.18m",
+      "color": "cyan"
+    },
+    {
+      "label": "Liftoff ω",
+      "sublabel": "起飞角速度",
+      "value": "11.4r/s",
+      "color": "red"
+    },
+    {
+      "label": "Rot@Land",
+      "sublabel": "落地时旋转",
+      "value": "360°",
+      "color": "purple"
+    },
+    {
+      "label": "Success",
+      "sublabel": "成功率",
+      "value": "100%",
+      "color": "yellow"
+    },
+    {
+      "label": "Launch",
+      "sublabel": "起跳率",
+      "value": "100%",
+      "color": "green"
+    }
+  ],
+  "history_file": "metrics_history.jsonl"
+}

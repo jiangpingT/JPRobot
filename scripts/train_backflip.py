@@ -37,37 +37,53 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from jprobot.training.env_backflip import BittleBackflipEnv
 
 # ── 目录结构 ──────────────────────────────────────────────────────────────
-TRAINED_DIR = Path(__file__).parent.parent / "trained" / "backflip"
+TRAINED_DIR     = Path(__file__).parent.parent / "trained" / "backflip_v60"
+TRAINED_DIR_V57 = Path(__file__).parent.parent / "trained" / "backflip_v57"  # V57：rotation=364.7°，rot@land=351.5°
+TRAINED_DIR_V58 = Path(__file__).parent.parent / "trained" / "backflip_v58"  # V58：rotation=369.1°，rot@land=357.4°
+TRAINED_DIR_V59 = Path(__file__).parent.parent / "trained" / "backflip_v59"  # V59：rotation=371.0°，rot@land=359.0°（距360仅1°！）
 
 # ── 课程定义 ──────────────────────────────────────────────────────────────
 # 每个阶段：(training_phase, timesteps, ent_coef)
 # ent_coef（熵系数）控制探索量：
 #   - 初期高熵（0.02）→ 更多随机探索，有助于发现新动作
 #   - 后期低熵（0.005）→ 更多利用已学策略，精化动作质量
+#
+# v46 方案（旋转完整度奖励，从V43热启）：
+#   V43-V45 诊断：rotation固化在332-344°，liftoff 10+ r/s，无法突破到360°。
+#   根因：奖励函数在286°成功门槛后无任何激励继续旋转，agent 旋转到338°就落地了。
+#   V46 核心创新：W_ROT_COMPLETENESS=1000（新增）。
+#     成功时额外奖励 = 1000 × (rot_deg - 286) / 74，rot_deg ∈ [286°, 360°]。
+#     360°完整落地额外得1000分，而286°快速落地额外得0分。
+#   激励结构（V46）：
+#     最优 360°直立落地: W_SUCCESS×2.5 + 1000 = 3500
+#     V43现状 338.9°倾斜28°: ~1933 + 712 = 2645
+#     gaming 286°直立落地: W_SUCCESS×2.5 + 0 = 2500（差于V43现状，无gaming动机）
+#   从 V43 热启（rotation=338.9°，各版本最高，最接近360°目标）。
+#   ent_coef=0.003（恢复标准，V45高探索反而退步）。
 CURRICULUM = [
-    ("jump",   1_000_000, 0.02),   # 阶段1: 1M步，高探索，只学起跳
-    ("rotate", 1_500_000, 0.01),   # 阶段2: 1.5M步，学旋转
-    ("land",   2_000_000, 0.008),  # 阶段3: 2M步，学落地
-    ("full",   2_000_000, 0.005),  # 阶段4: 2M步，精化完整后空翻
+    ("full", 5_000_000, 0.006),   # v60：最后一冲！ent=0.006同配方，从V59热启，目标rot@land=360°
+                                   # V59成果🎉：rotation=371.0°，rot@land=359.0°（+1.6°！），距360仅1°！
+                                   # V59机制：ent=0.006第三次连续突破，战略性过旋转11°→落地359.0°。
+                                   # V59问题：std=0（固化），eval reward下降（6679 vs V58的8028）→过旋转W_OVERROT代价增加。
+                                   # V60策略：同ent_coef=0.006，从V59热启（359.0°基础）。
+                                   # 目标：rot@land从359.0°→360.0°（最后1°！）。
+                                   # 注意：如果过旋转继续增加（>15°），评估奖励会进一步下降，但rot@land才是真实指标。
+                                   # 终止条件：rot@land≥359.5°或连续两版没有提升时停止循环。
 ]
 
-STAGE_ORDER = ["jump", "rotate", "land", "full"]
+STAGE_ORDER = ["full"]  # 单 full 阶段，从 V54 full/best.zip 热启动（360.3°基础）
 
 
 _STAGE_LABELS = {"jump": "起跳", "rotate": "旋转", "land": "落地", "full": "完整"}
-_STAGE_TOTAL_STEPS = {
-    "jump":   1_000_000,
-    "rotate": 1_500_000,
-    "land":   2_000_000,
-    "full":   2_000_000,
-}
-_CURRICULUM_CUMULATIVE = {
-    "jump":   1_000_000,
-    "rotate": 2_500_000,
-    "land":   4_500_000,
-    "full":   6_500_000,
-}
-_TOTAL_STEPS = 6_500_000
+
+# 从 CURRICULUM 自动推导，避免手动同步出错
+_STAGE_TOTAL_STEPS      = {s: t for s, t, _ in CURRICULUM}
+_TOTAL_STEPS            = sum(t for _, t, _ in CURRICULUM)          # 9_000_000
+_CURRICULUM_CUMULATIVE  = {}
+_cumsum = 0
+for _s, _t, _ in CURRICULUM:
+    _cumsum += _t
+    _CURRICULUM_CUMULATIVE[_s] = _cumsum
 
 
 class BackflipProgressCallback(BaseCallback):
@@ -125,8 +141,8 @@ class BackflipProgressCallback(BaseCallback):
 
     def _write_live_dashboard(self, rew_mean: float, len_mean: float, now_str: str) -> None:
         """写 trained/backflip/live_dashboard.json 和追加 metrics_history.jsonl。"""
-        base_dir = TRAINED_DIR  # trained/backflip/
-        stage_order = ["jump", "rotate", "land", "full"]
+        base_dir = TRAINED_DIR
+        stage_order = STAGE_ORDER
 
         # 累计全局步数
         prev_stages = stage_order[: stage_order.index(self.stage)]
@@ -177,35 +193,50 @@ class BackflipProgressCallback(BaseCallback):
                 "note":   note,
             })
 
-        # metrics 卡片（从当前阶段 fixed_eval 或 progress 读）
+        # metrics 卡片（live = 实时 rollout；eval = 上次 fixed_eval 结果）
         cur_eval_path = base_dir / self.stage / "fixed_eval.json"
-        success_rate_str = "N/A"
-        launch_rate_str  = "N/A"
-        rotation_str     = "N/A"
+        success_rate_str  = "N/A"
+        launch_rate_str   = "N/A"
+        rotation_str      = "N/A"
+        height_str        = "N/A"
+        liftoff_vel_str   = "N/A"
+        rot_at_land_str   = "N/A"
         if cur_eval_path.exists():
             try:
                 with open(cur_eval_path) as f:
                     ev = json.load(f)
                 m = ev.get("metrics", {})
-                sr = m.get("success_rate")
-                lr = m.get("launch_rate")
+                sr  = m.get("success_rate")
+                lr  = m.get("launch_rate")
                 rot = m.get("mean_max_rotation_deg")
+                h   = m.get("mean_max_height_m")
+                lv  = m.get("mean_liftoff_ang_vel")
+                rl  = m.get("mean_rot_at_landing_deg")
                 if sr  is not None: success_rate_str = f"{sr*100:.0f}%"
                 if lr  is not None: launch_rate_str  = f"{lr*100:.0f}%"
                 if rot is not None: rotation_str     = f"{rot:.1f}°"
+                if h   is not None: height_str       = f"{h:.2f}m"
+                if lv  is not None: liftoff_vel_str  = f"{lv:.1f}r/s"
+                if rl  is not None: rot_at_land_str  = f"{rl:.0f}°"
             except (OSError, json.JSONDecodeError):
                 pass
 
         metrics_spec = [
-            {"label": "当前奖励", "value": round(rew_mean, 1), "color": "green"},
-            {"label": "旋转",     "value": rotation_str,       "color": "blue"},
-            {"label": "成功率",   "value": success_rate_str,   "color": "yellow"},
-            {"label": "起跳率",   "value": launch_rate_str,    "color": "green"},
+            # ── 实时指标（每 rollout 更新）──────────────────────────────
+            {"label": "Reward",       "sublabel": "当前奖励",    "value": round(rew_mean, 1),  "color": "green"},
+            {"label": "ep_len",       "sublabel": "每局步数",    "value": round(len_mean, 0),  "color": "orange"},
+            # ── 固定评估指标（上次 fixed_eval 结果）────────────────────
+            {"label": "Rotation",     "sublabel": "旋转角度",    "value": rotation_str,        "color": "blue"},
+            {"label": "Height",       "sublabel": "腾空高度",    "value": height_str,          "color": "cyan"},
+            {"label": "Liftoff ω",    "sublabel": "起飞角速度",  "value": liftoff_vel_str,     "color": "red"},
+            {"label": "Rot@Land",     "sublabel": "落地时旋转",  "value": rot_at_land_str,     "color": "purple"},
+            {"label": "Success",      "sublabel": "成功率",      "value": success_rate_str,    "color": "yellow"},
+            {"label": "Launch",       "sublabel": "起跳率",      "value": launch_rate_str,     "color": "green"},
         ]
 
         spec = {
-            "title":    "后空翻训练",
-            "run_id":   "backflip",
+            "title":    "后空翻训练 v60（最后1° rot@land=360° 终极冲击）",
+            "run_id":   "backflip_v60",
             "updated_at": now_str,
             "progress": {
                 "current_steps": global_steps,
@@ -328,7 +359,7 @@ def eval_stage(stage: str, best_model: Path):
             import json
             with open(prev_path) as f:
                 prev = json.load(f)
-        result = run_backflip_eval(best_model, stage=stage, episodes=20)
+        result = run_backflip_eval(best_model, stage=stage, episodes=20, disable_rsi=True)
         _print_summary(result, prev)
     except Exception as e:
         print(f"[AutoEval] 验收评估失败（不影响训练）: {e}")
@@ -351,13 +382,28 @@ def main():
     print(f"device: cpu（MPS 对小网络反而慢 2.3×，详见 /tmp/mps_bench.py）")
 
     if args.stage == "all":
-        prev_model = args.resume
+        # v46 热启动：从 V43 full/best.zip（rotation=338.9°，各版本最高）。
+        # V45 教训：ent_coef=0.01 高探索从V41热启，反而退步到332°（比V43还低）。
+        # V46 核心修复：新奖励 W_ROT_COMPLETENESS=1000，激励旋转到360°。
+        #   V43 是当前 rotation 最高的稳定版本，从它热启可保留338.9°的旋转基础。
+        #   新奖励：286°落地额外+0，360°落地额外+1000，给agent明确的"旋转更多"梯度。
+        v59_warm = TRAINED_DIR_V59 / "full" / "best.zip"
+        if args.resume:
+            prev_model = args.resume
+        elif v59_warm.exists():
+            prev_model = v59_warm
+            print(f"[V60] full 阶段将从 V59 full/best.zip 热启动: {v59_warm}")
+            print(f"[V60] 策略：ent_coef=0.006，最后1°冲击！rot@land 359°→360°！")
+        else:
+            prev_model = None
+            print("[V60] 未找到 V59 full/best.zip，full 阶段从头训练")
+
         for stage, timesteps, ent_coef in CURRICULUM:
             best = train_stage(stage, timesteps, ent_coef, prev_model, args.envs)
             if not args.no_eval:
                 eval_stage(stage, best)
             prev_model = best
-        print("\n完整课程训练结束！")
+        print("\n[V60] 完整课程训练结束！")
         print(f"最终模型: {TRAINED_DIR / 'full' / 'best.zip'}")
         print(f"验收报告: {TRAINED_DIR / 'full' / 'fixed_eval.json'}")
     else:

@@ -1,0 +1,23 @@
+{
+  "model": "trained/backflip_v60/full/best.zip",
+  "stage": "full",
+  "episodes": 20,
+  "evaluated_at": "2026-03-01T14:03:18",
+  "metrics": {
+    "mean_episode_reward": 7705.4,
+    "mean_ep_len": 61.0,
+    "mean_max_rotation_deg": 372.3,
+    "mean_max_height_m": 0.1822,
+    "success_rate": 1.0,
+    "launch_rate": 1.0,
+    "landing_rate": 1.0,
+    "pct_over_90deg": 1.0,
+    "pct_over_180deg": 1.0,
+    "pct_over_270deg": 1.0,
+    "ep_len_std": 0.0,
+    "rotation_std_deg": 0.0,
+    "mean_liftoff_ang_vel": 11.43,
+    "mean_rot_at_landing_deg": 360.2
+  },
+  "assessment": "疑似 Gaming: 起飞角速度=11.4rad/s过大"
+}
