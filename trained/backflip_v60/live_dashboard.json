@@ -1,7 +1,7 @@
 {
   "title": "后空翻训练 v60（最后1° rot@land=360° 终极冲击）",
   "run_id": "backflip_v60",
-  "updated_at": "2026-03-01T14:37:29",
+  "updated_at": "2026-03-01T14:50:23",
   "progress": {
     "current_steps": 5000000,
     "total_steps": 5000000
@@ -19,13 +19,13 @@
     {
       "label": "Reward",
       "sublabel": "当前奖励",
-      "value": 4476.8,
+      "value": 4872.0,
       "color": "green"
     },
     {
       "label": "ep_len",
       "sublabel": "每局步数",
-      "value": 53.0,
+      "value": 56.0,
       "color": "orange"
     },
     {

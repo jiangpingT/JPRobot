@@ -1,9 +1,9 @@
 {
   "stage": "full",
-  "timesteps": 48390144,
+  "timesteps": 48906240,
   "total_timesteps": 5000000,
-  "progress": 9.6780288,
-  "ep_rew_mean": 4476.79819929,
-  "ep_len_mean": 53.03,
-  "updated_at": "2026-03-01T14:37:29"
+  "progress": 9.781248,
+  "ep_rew_mean": 4871.99147094,
+  "ep_len_mean": 55.69,
+  "updated_at": "2026-03-01T14:50:23"
 }

@@ -93,6 +93,8 @@ def run_backflip_eval(
     landeds          = []
     liftoff_ang_vels = []   # 腾空瞬间向后角速度（rad/s，正值=向后）
     rot_at_landings  = []   # 落地瞬间已积累旋转角（度）
+    post_heights     = []   # v65新增：各成功局的post-success阶段平均body高度（m）
+    post_feet_list   = []   # v65新增：各成功局的post-success阶段平均脚接触数
 
     for ep in range(episodes):
         obs, _ = env.reset()
@@ -103,6 +105,8 @@ def run_backflip_eval(
         ep_max_rot        = 0.0
         ep_liftoff_ang_vel = None   # 本局腾空瞬间角速度（只取第一帧）
         ep_rot_at_landing  = None   # 本局落地瞬间旋转角
+        ep_post_heights    = []     # v65新增：本局成功后各步body高度（m）
+        ep_post_feet       = []     # v65新增：本局成功后各步脚接触数
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
@@ -121,6 +125,11 @@ def run_backflip_eval(
             if info.get("just_landed") and ep_rot_at_landing is None:
                 ep_rot_at_landing = info.get("rotation_deg", 0.0)
 
+            # 收集成功后站稳阶段的身体高度和脚接触（v65新增）
+            if info.get("success"):
+                ep_post_heights.append(info.get("height_m", 0.0))
+                ep_post_feet.append(info.get("n_feet", 0))
+
             done = terminated or truncated
 
         ep_rewards.append(total_reward)
@@ -135,6 +144,9 @@ def run_backflip_eval(
             liftoff_ang_vels.append(ep_liftoff_ang_vel)
         if ep_rot_at_landing is not None:
             rot_at_landings.append(ep_rot_at_landing)
+        if ep_post_heights:
+            post_heights.append(float(np.mean(ep_post_heights)))
+            post_feet_list.append(float(np.mean(ep_post_feet)))
 
         status = "完成" if info.get("success") else "未完成"
         lv_str = f"  lv={ep_liftoff_ang_vel:.1f}r/s" if ep_liftoff_ang_vel is not None else ""
@@ -167,6 +179,9 @@ def run_backflip_eval(
     # Gaming 检测指标
     mean_liftoff_vel   = float(np.mean(liftoff_ang_vels)) if liftoff_ang_vels else 0.0
     mean_rot_at_land   = float(np.mean(rot_at_landings))  if rot_at_landings  else 0.0
+    mean_post_height   = float(np.mean(post_heights))     if post_heights     else 0.0
+    mean_post_feet     = float(np.mean(post_feet_list))   if post_feet_list   else 0.0
+    mean_height_ratio  = min(1.0, max(0.0, (mean_post_height - 0.04) / (0.10 - 0.04))) if post_heights else 0.0
 
     result = {
         "model": str(model_path),
@@ -191,6 +206,10 @@ def run_backflip_eval(
             "rotation_std_deg":      round(std_rot,          1),
             "mean_liftoff_ang_vel":  round(mean_liftoff_vel, 2),  # 正值=向后（正常<6, gaming>8）
             "mean_rot_at_landing_deg": round(mean_rot_at_land, 1),  # <90°=落地gaming
+            # ── V65 站立恢复评估指标 ────────────────────────────
+            "mean_post_stand_height_m": round(mean_post_height, 4),  # 成功后站稳阶段平均body高度（m）
+            "mean_post_height_ratio":   round(mean_height_ratio, 3), # 0=贴地(0.04m), 1=正常站立(0.10m)
+            "mean_post_n_feet":         round(mean_post_feet, 2),    # 成功后平均脚接触数（满分4）
         },
         "assessment": _assess(stage, mean_rot, success_rate, launch_rate,
                                mean_len, mean_liftoff_vel, mean_rot_at_land),
@@ -320,6 +339,21 @@ def _print_summary(result: dict, prev: dict | None = None):
     print("  %s 旋转一致性:  ±%.1f°           [<5° = 策略固化/deterministic lock]"
           % (_gaming_flag(deterministic), rot_std))
 
+    # ── 站立恢复指标（V65 新增）──────────────────────────────────────────
+    post_height_ratio = m.get("mean_post_height_ratio", 0.0)
+    post_n_feet = m.get("mean_post_n_feet", 0.0)
+    post_stand_h = m.get("mean_post_stand_height_m", 0.0)
+    if post_stand_h > 0:
+        print()
+        print("  ── 站立恢复指标（V65）───────────────────────────────────")
+        print("  后空翻后身高:  %s  %.4f m  (ratio=%.2f，目标≥0.09m)"
+              % (_bar(post_height_ratio, 1.0, 20), post_stand_h, post_height_ratio))
+        feet_flag = "[OK] ≥3脚着地" if post_n_feet >= 3 else "[WARN] 脚接触不足"
+        print("  脚接触均值:    %.2f/4 脚  %s" % (post_n_feet, feet_flag))
+        stand_ok = post_height_ratio >= 0.833
+        print("  站立评估:      %s  (height_ratio≥0.833=达标，当前=%.3f)"
+              % ("[PASS]" if stand_ok else "[FAIL]", post_height_ratio))
+
     # ── 基础指标 ─────────────────────────────────────────────────────────
     print()
     print("  ── 基础指标 ─────────────────────────────────────────────")
@@ -346,6 +380,9 @@ def _print_summary(result: dict, prev: dict | None = None):
     print("  落地时旋转      落地瞬间已累计旋转了多少度。<90°+落地率高=没翻就落地骗落地分。")
     print("  旋转一致性      20局中旋转角的标准差。≈0°=所有局完全相同，策略死锁在局部最优。")
     print("  >90°/>180°/>270°比例  各局中越过该角度门槛的百分比。全0%=从未突破第一个里程碑。")
+    print("  后空翻后身高    成功后站稳阶段平均body离地高度。0.04m=贴地，0.10m=正常站立，目标≥0.09m。")
+    print("  脚接触均值      成功后站稳阶段平均接触地面的脚数（0-4）。≥3=能站稳，<2=可能仍在翻滚倒地。")
+    print("  站立评估        height_ratio≥0.833（body≥0.09m）视为达标（PASS）。")
     print()
 
 

@@ -37,11 +37,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from jprobot.training.env_backflip import BittleBackflipEnv
 
 # ── 目录结构 ──────────────────────────────────────────────────────────────
-TRAINED_DIR     = Path(__file__).parent.parent / "trained" / "backflip_v64"
-TRAINED_DIR_V63 = Path(__file__).parent.parent / "trained" / "backflip_v63"  # V63：W_POST_STAND=50，uprightness≈0.95但平趴骗分（无高度激励）
-TRAINED_DIR_V62 = Path(__file__).parent.parent / "trained" / "backflip_v62"  # V62：W_POST_STAND=25，avg uprightness≈0.75，视觉仍躺平
-TRAINED_DIR_V61 = Path(__file__).parent.parent / "trained" / "backflip_v61"  # V61：ep_len=100（post-success机制生效），但站立梯度不足
-TRAINED_DIR_V60 = Path(__file__).parent.parent / "trained" / "backflip_v60"  # V60：rotation=372.3°，rot@land=360.2°（完美落地！）
+TRAINED_DIR     = Path(__file__).parent.parent / "trained" / "backflip_v71"
+TRAINED_DIR_V70 = Path(__file__).parent.parent / "trained" / "backflip_v70"  # V70：RSI_GETUP 60%，height=0.0226m，仍固化（所有版本落地高度一致=0.0226m）
+TRAINED_DIR_V69 = Path(__file__).parent.parent / "trained" / "backflip_v69"  # V69：从V64热启（打破固化链），height_ratio=0.00，body=0.0226m，仍固化（±0°）
+TRAINED_DIR_V68 = Path(__file__).parent.parent / "trained" / "backflip_v68"  # V68：ent_coef=0.015+基线0.01修复，height_ratio=0.00，仍固化（±0°）
+TRAINED_DIR_V67 = Path(__file__).parent.parent / "trained" / "backflip_v67"  # V67：uprightness×height_ratio门控，height_ratio=0.00（梯度盲区）
+TRAINED_DIR_V66 = Path(__file__).parent.parent / "trained" / "backflip_v66"  # V66：趴地RSI 20%，height_ratio=0.00
+TRAINED_DIR_V65 = Path(__file__).parent.parent / "trained" / "backflip_v65"  # V65：POST_SUCCESS 120步，height_ratio=0.00（固化链开始）
+TRAINED_DIR_V64 = Path(__file__).parent.parent / "trained" / "backflip_v64"  # V64：W_POST_HEIGHT=30，body=0.052m（height_ratio=0.20，固化链之前最好结果！）
+TRAINED_DIR_V63 = Path(__file__).parent.parent / "trained" / "backflip_v63"  # V63：W_POST_STAND=50，趴地骗分（无高度激励）
+TRAINED_DIR_V62 = Path(__file__).parent.parent / "trained" / "backflip_v62"  # V62：W_POST_STAND=25，仍躺平
+TRAINED_DIR_V61 = Path(__file__).parent.parent / "trained" / "backflip_v61"  # V61：ep_len=100，站立梯度不足
+TRAINED_DIR_V60 = Path(__file__).parent.parent / "trained" / "backflip_v60"  # V60：rot@land=360.2°，完美落地！
 
 # ── 课程定义 ──────────────────────────────────────────────────────────────
 # 每个阶段：(training_phase, timesteps, ent_coef)
@@ -62,14 +69,18 @@ TRAINED_DIR_V60 = Path(__file__).parent.parent / "trained" / "backflip_v60"  # V
 #   从 V43 热启（rotation=338.9°，各版本最高，最接近360°目标）。
 #   ent_coef=0.003（恢复标准，V45高探索反而退步）。
 CURRICULUM = [
-    ("full", 5_000_000, 0.006),   # v64：新增 W_POST_HEIGHT=30（高度奖励），从V63热启。
-                                   # V63成果：uprightness≈0.95（body近乎水平），reward=9758（大幅提升）
-                                   # V63问题：uprightness 盲区——"平趴地上"(pitch=0)和"四腿站立"(pitch=0)都得满分
-                                   # V64修复：height_ratio=(height-0.04)/(0.10-0.04)，奖励身体离地高度
-                                   # 激励结构：平趴(height≈0)=2000分，站立(height=0.10m)=2000+1200=3200分，差价1200分
+    ("full", 5_000_000, 0.010),   # v71：RSI_GETUP_PROB 100%，专门训练恢复策略，从 V64 热启动。
+                                   # V68 评估结果：height_ratio=0.00，策略固化±0°
+                                   # 根因：V65-V68 形成"固化链"（每次从已固化版本热启），
+                                   #   ent_coef 提到 0.015 仍无法打破，说明局部最优极深。
+                                   # 策略：跳过固化链，回到 V64（固化链前唯一有进展的版本）。
+                                   #   V64 height_ratio=0.20，body=0.052m，是真实有进展的热启点。
+                                   # ent_coef=0.010：比 V64 的 0.006 高（需要更多探索），
+                                   #   但比 V68 的 0.015 低（避免过强导致退步）。
+                                   # W_POST_HEIGHT 同步从 100→200（env_backflip.py中修改）。
 ]
 
-STAGE_ORDER = ["full"]  # 单 full 阶段，从 V63 full/best.zip 热启动
+STAGE_ORDER = ["full"]  # 单 full 阶段，从 V64 full/best.zip 热启动（打破固化链）
 
 
 _STAGE_LABELS = {"jump": "起跳", "rotate": "旋转", "land": "落地", "full": "完整"}
@@ -233,8 +244,8 @@ class BackflipProgressCallback(BaseCallback):
         ]
 
         spec = {
-            "title":    "后空翻训练 v64（高度奖励 W_POST_HEIGHT=30，解决平趴骗分）",
-            "run_id":   "backflip_v64",
+            "title":    "后空翻训练 v67（uprightness×height_ratio门控，封死贴地骗分）",
+            "run_id":   "backflip_v67",
             "updated_at": now_str,
             "progress": {
                 "current_steps": global_steps,
@@ -380,26 +391,30 @@ def main():
     print(f"device: cpu（MPS 对小网络反而慢 2.3×，详见 /tmp/mps_bench.py）")
 
     if args.stage == "all":
-        # v63 热启动：从 V62 full/best.zip（W_POST_STAND=25，avg uprightness=0.75）。
-        # V62 教训：25分/步 梯度不足以克服躺平惯性，viz可见step 96仍躺平。
-        # V63 核心修复：W_POST_STAND=50（翻倍），最大额外2000分，占总奖励22%。
-        v63_warm = TRAINED_DIR_V63 / "full" / "best.zip"
+        # v71 热启动：从 V64 full/best.zip，RSI_GETUP_PROB 100% 专门训练恢复策略。
+        # V70 诊断：60%RSI仍然height=0.0226m。重大发现：所有版本落地高度=0.0226m，
+        #   V64的"height_ratio=0.20"是旧评估脚本假象，实际也是0.0226m。
+        # 策略转变：后空翻policy已成熟（V64完美落地），本轮只训练恢复能力。
+        # V71：RSI_GETUP_PROB=1.00（100%趴地），每局直接从趴地练站立。
+        # 物理验证：PD控制可从0.04m达到0.089m，证明物理可行，只是RL未学到。
+        v64_warm = TRAINED_DIR_V64 / "full" / "best.zip"
         if args.resume:
             prev_model = args.resume
-        elif v63_warm.exists():
-            prev_model = v63_warm
-            print(f"[V64] full 阶段将从 V63 full/best.zip 热启动: {v63_warm}")
-            print(f"[V64] 策略：ent_coef=0.006，W_POST_HEIGHT=30（新增高度奖励，迫使用腿撑起身体）")
+        elif v64_warm.exists():
+            prev_model = v64_warm
+            print(f"[V71] full 阶段将从 V64 full/best.zip 热启动: {v64_warm}")
+            print(f"[V71] RSI_GETUP_PROB=1.00（100%趴地，专门训练恢复策略）")
+            print(f"[V71] ent_coef=0.010，W_POST_HEIGHT=200（保持）")
         else:
             prev_model = None
-            print("[V64] 未找到 V63 full/best.zip，full 阶段从头训练")
+            print("[V71] 未找到 V64 full/best.zip，full 阶段从头训练")
 
         for stage, timesteps, ent_coef in CURRICULUM:
             best = train_stage(stage, timesteps, ent_coef, prev_model, args.envs)
             if not args.no_eval:
                 eval_stage(stage, best)
             prev_model = best
-        print("\n[V64] 完整课程训练结束！")
+        print("\n[V71] 完整课程训练结束！")
         print(f"最终模型: {TRAINED_DIR / 'full' / 'best.zip'}")
         print(f"验收报告: {TRAINED_DIR / 'full' / 'fixed_eval.json'}")
     else:

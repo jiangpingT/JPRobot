@@ -192,6 +192,60 @@ V4 折中方案：在 47 维基础上加这两项 → 203 维。
 
 ---
 
+---
+
+### V5～V8：PPO 的系统性失败（2026-02-27）
+
+**结论：PPO 在 CPU 上训练 Humanoid-v4 不可行（无法在 15M 步内到达 500）**
+
+| 版本 | n_steps | 关键变化 | 峰值ep_len | 结局 |
+|------|---------|---------|-----------|------|
+| v5 | 512 | 多参数同时改 | 104 @2.34M | 崩到28 |
+| v6 | 512 | VecNorm+203维 | 127 @4.65M | 降至109 |
+| v7a | 512 | Gymnasium 376维 | 127 @2.55M | 崩到76 |
+| v7b | 512 | +Tanh+norm_rew | 125 @2.57M | 崩至92 |
+| v8 | 2048 | 稳定参数+Gymnasium | 146 @3.34M | 稳定但增速2/M |
+
+PPO 根本瓶颈：on-policy，需要 10M+ 步（GPU）才能到 ep_len=500+，CPU 太慢。
+
+---
+
+### SAC：真正行走（2026-02-27）✅
+
+**算法切换：PPO → SAC（Soft Actor-Critic）**
+
+SAC 核心优势：
+- Off-policy：利用 Replay Buffer 反复学习历史经验，样本效率比 PPO 高 5-10x
+- 自动熵调节（ent_coef='auto'）：自适应探索
+- SDE（State Dependent Exploration）：更高效的探索方式
+
+**训练结果（scripts/train_humanoid_sac.py）**：
+
+| 步数 | ep_len | 备注 |
+|------|--------|------|
+| 0.14M | 123.5 | PPO 需要 1M+ 步才到这里 |
+| 0.27M | 197.0 | PPO 永远没到过 |
+| 0.39M | 338.1 | PPO 永远没到过 |
+| 0.48M | **504.1** | ★ 首次突破 500！|
+| 0.52M | **598.9** | ★ 持续增长 |
+
+**关键超参（来自 RL Zoo Humanoid-v4 SAC 配置）**：
+- buffer_size=1_000_000（replay buffer，可反复学习）
+- use_sde=True（State Dependent Exploration，关键！）
+- sde_sample_freq=64
+- ent_coef='auto'（自动熵调节）
+- learning_rate=lin_schedule(7.3e-4)（线性衰减）
+- policy_kwargs: log_std_init=-3.67, net_arch=[400, 300]
+- 无 VecNormalize（SAC 对尺度鲁棒，不需要）
+
+**核心教训**：
+1. 算法选择比超参调优重要 100 倍
+2. PPO 适合低维离散/简单连续控制，SAC 适合高维连续控制（Humanoid）
+3. RL Zoo benchmark 结论：Humanoid-v4 SAC 2M 步 → 500+；PPO 10M 步 → 500+（GPU）
+4. CPU 上 SAC 仍能在 1M 步内到达 ep_len=600+！
+
+---
+
 ## 文件索引
 
 | 文件 | 说明 |
@@ -205,8 +259,14 @@ V4 折中方案：在 47 维基础上加这两项 → 203 维。
 | `scripts/train_humanoid_v3.py` | V3 训练脚本（10M步，V2→V1热启动） |
 | `scripts/train_humanoid_v4.py` | V4 训练脚本（15M步，从零开始） |
 | `scripts/fixed_eval_humanoid.py` | 评估脚本（支持v1/v2/v3/v4，默认v4） |
+| `scripts/train_humanoid_sac.py` | **✅ SAC 训练脚本（关键！0.5M步→ep_len=500+）** |
 | `jprobot/models/humanoid.xml` | 人形模型（从 Gymnasium 复制） |
 | `trained/humanoid_v1/` | V1 训练产物（5M步，ep_len~108） |
 | `trained/humanoid_v2/` | V2 训练产物（3.47M步，ep_len~116） |
 | `trained/humanoid_v3/` | V3 训练产物（2.3M步，ep_len~150） |
-| `trained/humanoid_v4/` | V4 训练产物（进行中，15M步，目标ep_len>500） |
+| `trained/humanoid_v4/` | V4 训练产物（3M步，ep_len~98） |
+| `trained/humanoid_v5/` | V5 训练产物（PPO n_steps=512，ep_len峰值104，崩溃） |
+| `trained/humanoid_v6/` | V6 训练产物（PPO VecNorm 203维，ep_len峰值127，缓降） |
+| `trained/humanoid_v7/` | V7 训练产物（PPO Gymnasium 376维，ep_len峰值127，崩溃） |
+| `trained/humanoid_v8/` | V8 训练产物（PPO n_steps=2048 Gymnasium，ep_len峰值146，稳定但慢） |
+| `trained/humanoid_sac/` | **✅ SAC 训练产物（ep_len=600+@0.52M步，真正行走！）** |

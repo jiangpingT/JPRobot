@@ -1,6 +1,8 @@
 # JPRobot 训练手册
 
 > 本文档记录 BittleX 强化学习训练的完整工程设计，包括架构、命令、参数、调试指南和已知问题。
+>
+> 变更联动请同时参考：`docs/JPROBOT_CHANGE_CHECKLIST.md`
 
 ---
 
@@ -43,6 +45,15 @@ KMP_DUPLICATE_LIB_OK=TRUE python -m jprobot.training.train --timesteps 5000000
 # 从快照续训
 KMP_DUPLICATE_LIB_OK=TRUE python -m jprobot.training.train --resume trained/snapshots/best.zip
 
+# 多方向单模型课程（2M 快速验证）
+KMP_DUPLICATE_LIB_OK=TRUE python -m jprobot.training.progressive --curriculum multidir_v1 --auto
+
+# 多方向精调课程（基于当前 best.zip，再训 2M）
+KMP_DUPLICATE_LIB_OK=TRUE python -m jprobot.training.progressive --curriculum multidir_v2_refine --auto
+
+# 右方向定向精调（短程 1M 验证）
+KMP_DUPLICATE_LIB_OK=TRUE python -m jprobot.training.progressive --curriculum multidir_v3_right_refine --auto
+
 # 可视化已训练模型
 KMP_DUPLICATE_LIB_OK=TRUE python -m jprobot.training.enjoy --model trained/snapshots/best.zip --episodes 3
 
@@ -52,6 +63,7 @@ python scripts/training_server.py --log /path/to/task.output
 
 > **注意**：macOS 上必须加 `KMP_DUPLICATE_LIB_OK=TRUE`，否则 OpenMP 冲突崩溃。
 > **Python 环境**：`/opt/homebrew/Caskroom/miniforge/base/envs/jprobot/bin/python`
+> **注意**：多方向训练把观测从 246 维升级到 248 维，旧 `best.zip` 不能直接续训。
 
 ---
 
@@ -67,6 +79,8 @@ jprobot/training/
 trained/
 ├── bittle_ppo.zip              最终模型（每次训练结束覆盖）
 ├── progressive_state.json      渐进训练完整进度（用于 --resume）
+├── direction_eval.json         多方向评估摘要（每轮 rollout 更新）
+├── direction_eval_history.jsonl 多方向评估时间序列
 ├── snapshots/
 │   ├── best.zip                当前历史最优模型（始终维护）
 │   ├── step_5.0M_rew_234.zip   奖励创新高时自动命名保存
@@ -80,15 +94,64 @@ trained/
 
 ## 模块架构
 
+### multidir_v1 — 多方向单模型课程
+
+目标：单一 PPO 策略学会按目标方向移动（前/后/左/右）。
+
+阶段设计（累计步数）：
+1. `0.5M`：固定前进（稳定步态）
+2. `1.2M`：偏向前进混合采样（`[0.5, 0.2, 0.15, 0.15]`）
+3. `2.0M`：均匀四方向采样（`[0.25, 0.25, 0.25, 0.25]`）
+
+运行命令：
+
+```bash
+KMP_DUPLICATE_LIB_OK=TRUE python -m jprobot.training.progressive --curriculum multidir_v1 --auto
+```
+
+### multidir_v2_refine — 多方向精调课程（弱方向补强）
+
+目标：在已有 `multidir_v1` 模型基础上，重点提升 `left/right/backward` 的稳定性与进度。
+
+阶段设计（累计步数）：
+1. `1.0M`：弱方向偏置采样（`[0.2, 0.2, 0.3, 0.3]`，顺序为前/后/左/右）
+2. `2.0M`：均匀四方向再平衡（`[0.25, 0.25, 0.25, 0.25]`）
+
+运行命令：
+
+```bash
+KMP_DUPLICATE_LIB_OK=TRUE python -m jprobot.training.progressive --curriculum multidir_v2_refine --auto
+```
+
+### 方向评估口径说明（务必区分）
+
+训练目录里有两类方向评估，作用不同：
+
+1. `trained/direction_eval.json`（训练中窗口统计）
+- 由训练回调自动写入。
+- 口径是最近窗口（默认 200 episodes）聚合。
+- 适合看趋势：四方向是否整体在变好。
+- 不适合作为最终验收结论（受训练探索噪声和窗口混合影响）。
+
+2. `trained/fixed_direction_eval.json`（训练后固定方向回放）
+- 训练结束后手动评估生成（通常每方向固定 N 局）。
+- 使用同一模型（一般 `trained/snapshots/best.zip`）做定向离线验收。
+- 适合做版本对比和上线前判断，能更真实暴露单方向短板。
+
+建议解读顺序：
+- 先看 `fixed_direction_eval.json`（验收结论）。
+- 再看 `direction_eval.json`（训练趋势是否一致）。
+
 ### env.py — 仿真环境
 
-**观测空间（246 维）**
+**观测空间（248 维）**
 
 | 维度 | 内容 | 范围 |
 |---|---|---|
 | 0-3 | 机体姿态四元数 (x,y,z,w) | [-1, 1] |
 | 4-5 | 角速度 roll/pitch (×0.1) | [-1, 1] |
 | 6-245 | 关节角历史 30帧 × 8关节（归一化） | [-1, 1] |
+| 246-247 | 目标方向向量 `(dx, dy)` | [-1, 1] |
 
 **动作空间（8 维连续）**
 
@@ -98,10 +161,10 @@ trained/
 **奖励函数**
 
 ```
-总奖励 = 前进奖励 - penalty_factor × (平滑惩罚 + 稳定惩罚 + 姿态惩罚 + 高度惩罚 + 手臂接触惩罚)
+总奖励 = 目标方向移动奖励 - penalty_factor × (平滑惩罚 + 稳定惩罚 + 手臂接触惩罚 [+ 可选高度项])
 
-前进奖励 = FAC_MOVEMENT × Δx × posture_factor
-  posture_factor = max(0, 1 - tilt/0.6)  # 倾斜 > ~35° 时前进奖励为 0
+目标方向移动奖励 = FAC_MOVEMENT × dot([Δx, Δy], [dx, dy])
+  其中 `[dx, dy]` 是本回合目标方向向量（前/后/左/右）
 
 penalty_factor = min(1.0, step_counter_session / PENALTY_STEPS)
   # 从 0 线性增长到 1，让机器狗先学会走路再被要求走得好

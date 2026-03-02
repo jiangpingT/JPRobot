@@ -28,6 +28,40 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 from .env import BittleGymEnv
 
 
+class LiveProgressCallback(BaseCallback):
+    """每个 rollout 结束后将实时进度写入 trained/live_progress.json。
+
+    Dashboard 读取此文件显示训练中的步数/奖励，解决 progressive_state.json
+    在阶段完成前 total_steps=0 导致进度条为 0% 的问题。
+    """
+
+    def __init__(self, output_path: str, total_timesteps: int):
+        super().__init__(verbose=0)
+        self.output_path = output_path
+        self.total_timesteps = total_timesteps
+
+    def _on_rollout_end(self) -> None:
+        current = self.num_timesteps
+        ep_rew_mean = None
+        if self.model.ep_info_buffer:
+            ep_rew_mean = float(np.mean([ep["r"] for ep in self.model.ep_info_buffer]))
+        data = {
+            "total_timesteps": current,
+            "total_timesteps_target": self.total_timesteps,
+            "progress": current / max(1, self.total_timesteps),
+            "ep_rew_mean": ep_rew_mean,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            with open(self.output_path, "w") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
+
+    def _on_step(self) -> bool:
+        return True
+
+
 class MetricsTracker(BaseCallback):
     """Collects rolling reward/ep_len metrics over a training stage.
 
@@ -67,11 +101,13 @@ class PostureMetricsCallback(BaseCallback):
 
     Writes a rolling summary to trained/posture_eval.json after every rollout,
     so the dashboard can show whether the robot is walking or crawling.
+    Also appends to posture_history.jsonl for trend charts.
     """
 
     def __init__(self, output_path: str, window: int = 100):
         super().__init__(verbose=0)
         self.output_path = output_path
+        self.history_path = output_path.replace('.json', '_history.jsonl')
         self.window = window
         self._heights: list[float] = []
         self._arm_contacts: list[float] = []
@@ -107,12 +143,82 @@ class PostureMetricsCallback(BaseCallback):
         with open(self.output_path, 'w') as f:
             json.dump(data, f, indent=2)
 
+        # Append to history for trend charts
+        history_point = {
+            'step': self.num_timesteps,
+            'h': round(avg_h, 4),
+            'ac': round(avg_ac, 3),
+            'tilt': round(avg_tilt, 1),
+        }
+        with open(self.history_path, 'a') as f:
+            f.write(json.dumps(history_point) + '\n')
 
-def linear_schedule(initial_value: float):
-    """Linear learning rate schedule: initial_value -> 0."""
-    def func(progress_remaining: float) -> float:
-        return progress_remaining * initial_value
-    return func
+
+class DirectionMetricsCallback(BaseCallback):
+    """Tracks per-direction target progress and episode length from env info."""
+
+    def __init__(self, output_path: str, window: int = 200):
+        super().__init__(verbose=0)
+        self.output_path = output_path
+        self.history_path = output_path.replace(".json", "_history.jsonl")
+        self.window = window
+        self._events: list[dict] = []
+
+    def _on_step(self) -> bool:
+        for info in self.locals.get("infos", []):
+            direction = info.get("direction")
+            if not direction:
+                continue
+            self._events.append({
+                "target_name": direction.get("target_name", "unknown"),
+                "avg_target_progress": float(direction.get("avg_target_progress", 0.0)),
+                "ep_len": float(direction.get("ep_len", 0.0)),
+            })
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if not self._events:
+            return
+        events = self._events[-self.window:]
+        by_dir: dict[str, list[dict]] = {}
+        for e in events:
+            by_dir.setdefault(e["target_name"], []).append(e)
+
+        per_direction = {}
+        for name, rows in by_dir.items():
+            progresses = [r["avg_target_progress"] for r in rows]
+            ep_lens = [r["ep_len"] for r in rows]
+            per_direction[name] = {
+                "episodes": len(rows),
+                "median_target_progress": float(np.median(progresses)),
+                "mean_target_progress": float(np.mean(progresses)),
+                "mean_ep_len": float(np.mean(ep_lens)),
+            }
+
+        data = {
+            "window_episodes": len(events),
+            "per_direction": per_direction,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        with open(self.output_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        history_point = {
+            "step": self.num_timesteps,
+            "updated_at": data["updated_at"],
+            "per_direction": {
+                k: {
+                    "median_target_progress": round(v["median_target_progress"], 6),
+                    "mean_target_progress": round(v["mean_target_progress"], 6),
+                    "mean_ep_len": round(v["mean_ep_len"], 2),
+                    "episodes": v["episodes"],
+                }
+                for k, v in per_direction.items()
+            },
+        }
+        with open(self.history_path, "a") as f:
+            f.write(json.dumps(history_point) + "\n")
 
 
 class SnapshotCallback(BaseCallback):
@@ -196,25 +302,38 @@ def train(
     return_metrics: bool = False,
     env_config: dict = None,
     ent_coef: float = 0.0,
+    env_class=None,
+    trained_dir: str = None,
 ):
     """Train a PPO agent for BittleX locomotion.
 
     Args:
         return_metrics: If True, returns (model, metrics_dict) instead of model.
-        env_config: Override reward weights for curriculum stages (passed to BittleGymEnv).
+        env_config: Override reward weights for curriculum stages (passed to env).
         ent_coef: Entropy coefficient for PPO (0.0 = pure policy gradient,
                   >0 encourages exploration).
+        env_class: Env class to use (default: BittleGymEnv). Pass BittleGymEnvV2
+                   or BittleGymEnvVelocity for alternate observation spaces.
+                   NOTE: models are NOT transferable between env classes (different obs dims).
     """
+    env_cls = env_class if env_class is not None else BittleGymEnv
     if net_arch is None:
         net_arch = [256, 256]
 
-    trained_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "trained"))
+    if trained_dir is None:
+        trained_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "trained")
+        )
+    else:
+        trained_dir = os.path.abspath(trained_dir)
+    os.makedirs(trained_dir, exist_ok=True)
     if save_path is None:
         save_path = os.path.join(trained_dir, "bittle_ppo")
 
     snapshot_dir = os.path.join(trained_dir, "snapshots")
     checkpoint_dir = os.path.join(trained_dir, "checkpoints")
     posture_eval_path = os.path.join(trained_dir, "posture_eval.json")
+    direction_eval_path = os.path.join(trained_dir, "direction_eval.json")
 
     print("[JPRobot Training]")
     print(f"  Timesteps:     {total_timesteps:,}")
@@ -223,6 +342,8 @@ def train(
     print(f"  ent_coef:      {ent_coef}")
     if env_config:
         print(f"  env_config:    {env_config}")
+        if "direction_mode" in env_config or "target_dir" in env_config:
+            print("  NOTE: direction-conditioned training enabled; reward not comparable with legacy forward-only runs.")
     print(f"  Snapshots:     {snapshot_dir}  (best model + named on improvement)")
     print(f"  Checkpoints:   {checkpoint_dir}  (every 2M steps)")
     print()
@@ -230,10 +351,12 @@ def train(
     # Build env_kwargs for vectorised environments
     env_kwargs = {"config": env_config} if env_config else {}
 
+    print(f"  Env class:     {env_cls.__name__}")
+
     # Check environment (skip when resuming — env hasn't changed)
     if not resume_from:
         print("Checking environment...")
-        env = BittleGymEnv(**env_kwargs)
+        env = env_cls(**env_kwargs)
         check_env(env)
         env.close()
         print("Environment check passed.")
@@ -241,7 +364,7 @@ def train(
     # Vectorised environments
     print(f"Creating {parallel_envs} parallel environments...")
     vec_env = make_vec_env(
-        BittleGymEnv, n_envs=parallel_envs, vec_env_cls=SubprocVecEnv,
+        env_cls, n_envs=parallel_envs, vec_env_cls=SubprocVecEnv,
         env_kwargs=env_kwargs or None,
     )
 
@@ -256,8 +379,7 @@ def train(
             vec_env,
             policy_kwargs=custom_arch,
             n_steps=n_steps,
-            learning_rate=linear_schedule(3e-4),
-            target_kl=0.05,
+            learning_rate=3e-4,
             ent_coef=ent_coef,
             verbose=1,
         )
@@ -268,8 +390,7 @@ def train(
             seed=seed,
             policy_kwargs=custom_arch,
             n_steps=n_steps,
-            learning_rate=linear_schedule(3e-4),
-            target_kl=0.05,
+            learning_rate=3e-4,
             ent_coef=ent_coef,
             verbose=1,
         )
@@ -286,12 +407,16 @@ def train(
     )
     metrics_cb = MetricsTracker()
     posture_cb = PostureMetricsCallback(output_path=posture_eval_path)
-    callbacks = CallbackList([snapshot_cb, checkpoint_cb, metrics_cb, posture_cb])
+    direction_cb = DirectionMetricsCallback(output_path=direction_eval_path)
+    live_progress_cb = LiveProgressCallback(
+        output_path=os.path.join(trained_dir, "live_progress.json"),
+        total_timesteps=total_timesteps,
+    )
+    callbacks = CallbackList([snapshot_cb, checkpoint_cb, metrics_cb, posture_cb, direction_cb, live_progress_cb])
 
     # Train
     print(f"Starting training for {total_timesteps:,} steps...")
-    print(f"  learning_rate: linear_schedule(3e-4 → 0)")
-    print(f"  target_kl:     0.05")
+    print(f"  learning_rate: 3e-4 (constant)")
     print(f"  ent_coef:      {ent_coef}")
     model.learn(
         total_timesteps=total_timesteps,

@@ -37,6 +37,25 @@ trained/snapshots/
 trained/dashboard.html
 !trained/.gitkeep
 
+# Trained model directories (untracked, large binaries)
+trained/backflip_v*/
+trained/humanoid_*/
+trained/route_*/
+trained/moe_eval.json
+trained/fixed_direction_eval.json
+trained/walk_*.png
+trained/walk_*.gif
+
+# Training visualization outputs (auto-generated)
+*.png
+*.gif
+
+# Training data directory (runtime, not source)
+jprobot/data/
+
+# Claude task files
+.claude/backflip-stand-task.md
+
 # Jupyter
 .ipynb_checkpoints/
 
