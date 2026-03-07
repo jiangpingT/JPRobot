@@ -344,6 +344,144 @@ if self._success and self._post_success_steps < POST_SUCCESS_STEPS:
 
 ---
 
+## 人形万向行走完整复盘（2026-03-03 完成，2026-03-05 归档）
+
+### 最终成果
+- **最优模型**：`trained/humanoid_velocity/best_v6_backup.zip`（vel_error=0.4469）
+- **环境**：`jprobot/training/env_humanoid_velocity.py`（obs=379 维）
+- **算法**：SAC，4 并行环境，线性 lr=7.3e-4，use_sde=True
+
+### 版本进化完整记录
+
+| 版本 | vel_error | 关键改动 | 累计步数 | 结论 |
+|------|-----------|---------|---------|------|
+| v1 | 1.639 | SIGMA=0.25（太小） | 3M | ❌ 无梯度，机器人不走 |
+| v2 | 0.582 | SIGMA=1.0，W_VEL=5.0 | +5M（热启v1） | ✅ 基准，零摔倒 |
+| v3 | 0.539 | VX_RANGE 2.0→1.2 | +3M（热启v2） | ✅ 改善7%，3M优于v2的5M |
+| v4 | 0.514 | wz左转偏置70%+WZ_ERROR_WEIGHT=0.70 | +3M（热启v3） | ✅ 改善4.6% |
+| v5 | 0.712 | SIGMA 1.0→0.75（失败） | +3M（热启v4） | ❌ 退步38% |
+| **v6** | **0.4469** | Method B（误差变化率奖励W_ERROR_DELTA=1.0） | +3M（热启v4） | ✅ **历史最优，首破0.45** |
+| v7 | 0.617 | Method A（3步误差历史obs 379→388） | 5M（从零） | ❌ 未超v6 |
+| v7热启 | 0.570 | v7继续热启 | +3M | ❌ 仍未超v6 |
+
+### 核心规律（万向行走）
+
+**规律一：SIGMA 必须与初始误差同量级**
+- SIGMA=0.25 时，vel_error=1.6 给出奖励≈0.004（梯度消失）
+- SIGMA=1.0 使任何速度方向都有梯度，是行走训练的正确设置
+- **禁止随意改 SIGMA**：改了必须同步修改评估脚本，否则比较无意义
+
+**规律二：速度命令范围不能超过物理上限**
+- MuJoCo Humanoid-v4 实际可达最高速约 1.2-1.5 m/s
+- VX_RANGE=2.0 导致大量"追不上"的命令，拖累整体 vel_error
+- 缩小到 1.2 后 3M 步即超越 5M 步的旧版本
+
+**规律三：方向偏置采样是双刃剑**
+- v4 左转偏置（70%）：左转略改善，后退严重退步（0.495→0.615）
+- 偏置采样等于压缩其他方向训练数据，必然此消彼长
+- v6 恢复均匀采样 + delta_reward 双效，左转反而大幅改善（0.584→0.363）
+
+**规律四：Method B（误差变化率）是目前最有效的改进**
+```python
+# 每步奖励加入误差下降趋势
+error_delta  = vel_error - self._prev_vel_error
+delta_reward = W_ERROR_DELTA * (-error_delta)   # 误差减小→正奖励
+self._prev_vel_error = vel_error
+```
+物理意义：鼓励策略"持续在变好"，而不只是"当前误差多小"
+
+**规律五：热启积累比单次大步数更有效**
+- v6 = 在 v4（9M累计）基础上热启3M，总12M → vel_error=0.447
+- v7 = 从零5M+热启3M，总8M → vel_error=0.570
+- 每次热启保留了所有历史学习成果，是 off-policy SAC 的核心优势
+
+**规律六：obs 维度变化=无法热启，代价极大**
+- Method A（历史观测）把 obs 379→388，必须从零训练
+- 8M 步从零仍不如 12M 步热启积累
+- 在这个任务上，架构升级的收益<热启积累的收益
+
+### v6 关键配置（最优参数）
+```python
+VX_RANGE      = (-1.0, 1.2)   # m/s，贴近物理上限
+WZ_LEFT_BIAS  = 0.5            # 均匀采样
+W_VEL         = 5.0
+SIGMA         = 1.0            # 核心参数，不要动
+WZ_ERROR_WEIGHT = 0.70
+W_ERROR_DELTA = 1.0            # Method B，关键改进
+```
+
+---
+
+## 人形跑步训练完整复盘（2026-03-05~07 完成归档）
+
+### 最终成果（run_v4）🎉
+- **模型**：`trained/humanoid_run/best.zip`
+- **环境**：`jprobot/training/env_humanoid_run.py`（obs=379，兼容v6热启）
+- **脚本**：`scripts/train_humanoid_run.py`、`scripts/eval_humanoid_run.py`、`scripts/viz_humanoid_run.py`
+- **验收（20局）**：ep_len=1000 满分，airborne%=26.8%，vx=1.00 m/s，ep_rew=13885（历史最高）
+- **视觉**：Playwright 截图确认机器人完全直立跑步（头顶最高点，双脚交替踏地）✅
+
+### 版本进化路线
+
+| 版本 | ep_rew | airborne% | vx | 问题 | 关键改动 |
+|------|--------|-----------|-----|------|---------|
+| run_v1 | — | 16.4% | 0.50 m/s | 腾空奖励从未触发 | 基础版，VX_RUN_THRESHOLD=1.5（超物理上限）|
+| run_v2 | 8586 | 22.6% | 0.74 m/s | 爬行gaming（水平滑行） | VX_RUN_THRESHOLD 1.5→0.5，VX_RANGE 上限 3.5→2.0 |
+| run_v3 | 10474 | 31.4% | 1.10 m/s | 仍前倾约45° | W_UPRIGHT=3.0（torso_z 线性直立奖励） |
+| **run_v4** | **13885** | **26.8%** | **1.00 m/s** | ✅ 达标 | W_UPRIGHT 3.0→6.0（超过速度追踪权重，直立优先）|
+
+### 三大核心规律（本项目新增）
+
+**规律七：阈值必须在物理可达范围内**
+MuJoCo Humanoid-v4 最高速约 1.2-1.5 m/s（关节力矩硬限制）。
+VX_RUN_THRESHOLD=1.5 导致腾空奖励永远触发不了——梯度为零，等于死代码。
+降到 0.5 后腾空奖励真正触发，airborne% 从 16% 升到 22%+。
+**规律：所有门槛/阈值设计前，先查物理上限，不要拍脑袋。**
+
+**规律八：直立奖励权重必须超过速度追踪权重才能主导行为**
+W_UPRIGHT=3.0 < W_VEL=5.0：机器人爬行（拿速度分）+ 轻微直立（拿部分直立分），合计更优。
+W_UPRIGHT=6.0 > W_VEL=5.0：直立成为最大单项奖励，机器人必须站立才能最大化总奖励。
+**规律：要改变行为优先级，对应奖励权重必须明确超过竞争项，而非接近。**
+
+**规律九：爬行 gaming 的识别方法**
+- 数据看起来好（vel_error 小、airborne 高）但视觉截图机器人水平
+- torso_z ≈ 1.0-1.1m（刚好在终止线以上，但远低于正常站立 1.25m）
+- 速度 vx 合理但姿势畸形
+- **诊断工具**：一定要用 Playwright/viz 视觉验证，数字好看不等于动作对**
+
+### 腾空检测实现（已验证）
+```python
+import mujoco
+
+def _both_feet_airborne(self) -> bool:
+    """利用 cfrc_ext（外部接触力）检测双脚是否腾空。"""
+    data  = self.env.unwrapped.data
+    model = self.env.unwrapped.model
+    lf = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "left_foot")
+    rf = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_foot")
+    lf_force = float(np.linalg.norm(data.cfrc_ext[lf, :3]))
+    rf_force = float(np.linalg.norm(data.cfrc_ext[rf, :3]))
+    return lf_force < CONTACT_THRESH and rf_force < CONTACT_THRESH
+```
+- `cfrc_ext[body_id, :3]` = 该 body 所受外部接触力向量（世界坐标系）
+- `CONTACT_THRESH=1.0 N`：脚踩地时力 >>1N，腾空时 ≈0
+- body 名称：`"left_foot"` / `"right_foot"`（Humanoid-v4 标准命名）
+
+### run_v4 关键配置（最优参数）
+```python
+# env_humanoid_run.py
+VX_RANGE          = (-0.5, 2.0)   # m/s，贴近物理上限
+VX_RUN_THRESHOLD  = 0.5           # m/s，必须低于实际可达速度
+W_AIRBORNE        = 2.0           # 腾空相奖励
+W_VEL             = 5.0           # 速度追踪奖励
+W_UPRIGHT         = 6.0           # 直立奖励（v4：必须 > W_VEL 才能主导行为）
+UPRIGHT_Z_MIN     = 1.0           # Humanoid-v4 健康下限
+UPRIGHT_Z_TARGET  = 1.3           # 完全直立约 1.25-1.35m
+W_ERROR_DELTA     = 1.0           # 误差变化率奖励（继承自万向行走 v6）
+```
+
+---
+
 ## 血泪教训（11 Bug 复盘）
 
 ### 致命级（必须牢记）

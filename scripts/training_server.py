@@ -195,6 +195,8 @@ class EvalEngine:
             return os.path.join(base, "humanoid_sac", "best.zip")
         if model_name == "__humanoid_velocity__":
             return os.path.join(base, "humanoid_velocity", "best.zip")
+        if model_name == "__humanoid_run__":
+            return os.path.join(base, "humanoid_run", "best.zip")
         if model_name == "__humanoid_upright_c2__":
             return os.path.join(base, "humanoid_upright", "C2", "best.zip")
         sac_ckpt_m = re.match(r'^__humanoid_sac_ckpt_(\d+)__$', model_name)
@@ -203,9 +205,10 @@ class EvalEngine:
             return os.path.join(base, "humanoid_sac", "checkpoints", f"humanoid_sac_{steps}_steps.zip")
         if model_name == "__backflip_latest__":
             versions = _list_backflip_versions(base)
-            if versions:
-                _, bf_dir = versions[0]
-                return os.path.join(base, bf_dir, "full", "best.zip")
+            for _, bf_dir in versions:  # 从最新版本开始，找第一个有 full/best.zip 的
+                p = os.path.join(base, bf_dir, "full", "best.zip")
+                if os.path.exists(p):
+                    return p
             return None
         # Backflip 各训练阶段
         for bf_ver, bf_dir in _list_backflip_versions(base):
@@ -230,6 +233,10 @@ class EvalEngine:
 
         if self.current_model == "__humanoid_velocity__":
             self._run_loop_humanoid_velocity()
+            return
+
+        if self.current_model == "__humanoid_run__":
+            self._run_loop_humanoid_run()
             return
 
         if self.current_model == "__humanoid_upright_c2__":
@@ -257,7 +264,7 @@ class EvalEngine:
         # Backflip 各阶段 → BittleBackflipEnv（obs=23，training_phase="full" 全奖励可视化）
         elif self.current_model.startswith("__backflip"):
             from jprobot.training.env_backflip import BittleBackflipEnv as _EnvCls
-            _env_kwargs = {"render_mode": None, "training_phase": "full"}
+            _env_kwargs = {"render_mode": None, "training_phase": "full", "disable_rsi": True}
         else:
             from jprobot.training.env import BittleGymEnv as _EnvCls
             _env_kwargs = {"render_mode": None}
@@ -287,6 +294,12 @@ class EvalEngine:
         last_mtime = os.path.getmtime(model_path)
         episode = 0
 
+        # Backward-compat: old models may have smaller obs space (e.g. obs=23 before v80 added
+        # success_flag). Truncate env obs to model's expected size so old checkpoints still run.
+        _model_obs_dim = model.observation_space.shape[0]
+        _env_obs_dim = env.observation_space.shape[0]
+        _obs_slice = slice(None, _model_obs_dim) if _model_obs_dim < _env_obs_dim else slice(None)
+
         try:
             while self.running:
                 episode += 1
@@ -302,7 +315,7 @@ class EvalEngine:
                 step = 0
                 terminated = False
                 while self.running:
-                    action, _ = model.predict(obs, deterministic=True)
+                    action, _ = model.predict(obs[_obs_slice], deterministic=True)
                     obs, reward, terminated, truncated, info = env.step(action)
                     step += 1
                     total_reward += reward
@@ -876,6 +889,142 @@ class EvalEngine:
                         model = SAC.load(model_path)
                         self._broadcast("model_updated", {
                             "file": "humanoid_velocity/best.zip",
+                            "mtime": cur_mtime,
+                        })
+                except Exception as e:
+                    self._broadcast("status", {"state": "error", "message": str(e)})
+                    break
+
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+            self.state = "idle"
+            self.running = False
+            self._broadcast("status", {"state": "stopped"})
+
+    def _run_loop_humanoid_run(self):
+        """跑步人形机器人可视化：HumanoidRunEnv + SAC 策略。
+
+        在万向行走基础上新增腾空相指标：
+          - airborne: 当前步是否双脚腾空
+          - airborne_pct: 本局累计腾空占比
+        """
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        from stable_baselines3 import SAC
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from jprobot.training.env_humanoid_run import HumanoidRunEnv
+
+        base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+        model_path = os.path.join(base, "humanoid_run", "best.zip")
+
+        if not self._is_readable_zip(model_path):
+            self._broadcast("status", {"state": "error", "message": f"Model not found: {model_path}"})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "loading"
+        self._broadcast("status", {"state": "loading", "model": "__humanoid_run__"})
+
+        try:
+            env = HumanoidRunEnv()
+            model = SAC.load(model_path)
+        except Exception as e:
+            self._broadcast("status", {"state": "error", "message": str(e)})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "running"
+        self._broadcast("status", {"state": "running", "model": "__humanoid_run__"})
+
+        last_mtime = os.path.getmtime(model_path)
+        episode = 0
+
+        try:
+            while self.running:
+                episode += 1
+                obs, info = env.reset()
+                cmd_vx = env.cmd_vx
+                cmd_vy = env.cmd_vy
+                cmd_wz = env.cmd_wz
+                total_reward = 0.0
+                start_x = None
+                max_distance = 0.0
+                airborne_steps = 0
+
+                self._broadcast("episode_start", {
+                    "episode": episode,
+                    "direction": f"cmd({cmd_vx:+.2f},{cmd_vy:+.2f},{cmd_wz:+.2f})",
+                    "vel_cmd": [round(cmd_vx, 3), round(cmd_vy, 3), round(cmd_wz, 3)],
+                })
+
+                step = 0
+                while self.running:
+                    action, _ = model.predict(obs, deterministic=True)
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    step += 1
+                    total_reward += float(reward)
+
+                    airborne = bool(info.get("airborne", False))
+                    if airborne:
+                        airborne_steps += 1
+
+                    pos = env.unwrapped.data.qpos[:3].tolist()
+                    orn_mj = env.unwrapped.data.qpos[3:7]
+                    orn_xyzw = [float(orn_mj[1]), float(orn_mj[2]),
+                                float(orn_mj[3]), float(orn_mj[0])]
+                    joints = [round(float(v), 4) for v in env.unwrapped.data.qpos[7:]]
+
+                    if start_x is None:
+                        start_x = pos[0]
+                    distance = pos[0] - start_x
+                    max_distance = max(max_distance, distance)
+
+                    vel_actual = info.get("vel_actual", (0.0, 0.0, 0.0))
+                    vel_error  = float(info.get("vel_error", 0.0))
+                    airborne_pct = round(100.0 * airborne_steps / max(1, step), 1)
+
+                    self._broadcast("frame", {
+                        "step": step,
+                        "position": [round(v, 5) for v in pos],
+                        "orientation": [round(v, 5) for v in orn_xyzw],
+                        "joints": joints,
+                        "reward": round(float(reward), 2),
+                        "robot_type": "humanoid",
+                        "vel_cmd":    [round(cmd_vx, 3), round(cmd_vy, 3), round(cmd_wz, 3)],
+                        "vel_actual": [round(float(vel_actual[0]), 3),
+                                       round(float(vel_actual[1]), 3),
+                                       round(float(vel_actual[2]), 3)],
+                        "vel_error":  round(vel_error, 4),
+                        "airborne":   airborne,
+                        "airborne_pct": airborne_pct,
+                    })
+
+                    time.sleep(0.02)
+
+                    if terminated or truncated:
+                        break
+
+                self._broadcast("episode_end", {
+                    "episode": episode,
+                    "total_reward": round(total_reward, 2),
+                    "steps": step,
+                    "survived": not terminated,
+                    "max_distance": round(max_distance, 4),
+                    "airborne_pct": round(100.0 * airborne_steps / max(1, step), 1),
+                })
+
+                try:
+                    cur_mtime = os.path.getmtime(model_path)
+                    if cur_mtime != last_mtime:
+                        last_mtime = cur_mtime
+                        model = SAC.load(model_path)
+                        self._broadcast("model_updated", {
+                            "file": "humanoid_run/best.zip",
                             "mtime": cur_mtime,
                         })
                 except Exception as e:
@@ -2193,6 +2342,7 @@ fetch('/api/viz/snapshots')
         : name === '__route_b__'                           ? '🟦 Route B v4（多方向稳定）'
         : name === '__humanoid_upright_c2__'               ? '🧍 Humanoid 直立 C2（软奖励直立版）'
         : name === '__humanoid_velocity__'                 ? '🏃 Humanoid 万向行走（速度命令跟随）'
+        : name === '__humanoid_run__'                      ? '🦅 Humanoid 跑步（腾空步态 22%）'
         : name === '__humanoid_sac__'                      ? '🚶 Humanoid SAC — best（弯腰基线版）'
         : name === '__backflip_latest__'                   ? '🤸 Backflip — best（最新最佳）'
         : sacCkptMatch ? `🚶 Humanoid SAC — ${(parseInt(sacCkptMatch[1])/1e6).toFixed(1)}M 步快照`
@@ -2283,16 +2433,23 @@ def _list_snapshots(trained_dir):
     if os.path.exists(vel_best):
         snapshots.append("__humanoid_velocity__")
 
+    # 跑步版（腾空步态，379维obs）
+    run_best = os.path.join(base, "humanoid_run", "best.zip")
+    if os.path.exists(run_best):
+        snapshots.append("__humanoid_run__")
+
     sac_best = os.path.join(base, "humanoid_sac", "best.zip")
     if os.path.exists(sac_best):
         snapshots.append("__humanoid_sac__")
 
     bf_versions = _list_backflip_versions(base)
     if bf_versions:
-        _bf_latest_ver, _bf_latest_dir = bf_versions[0]
-        bf_latest_path = os.path.join(base, _bf_latest_dir, "full", "best.zip")
-        if os.path.exists(bf_latest_path):
-            snapshots.append("__backflip_latest__")
+        # 从最新版本开始迭代，找第一个有 full/best.zip 的（V91 用 o00/ 无 full/，跳过）
+        for _, _bf_dir in bf_versions:
+            bf_latest_path = os.path.join(base, _bf_dir, "full", "best.zip")
+            if os.path.exists(bf_latest_path):
+                snapshots.append("__backflip_latest__")
+                break
 
     # 5. 时间混排：Humanoid SAC checkpoints + Backflip 各版本各阶段（最新在前）
     timed = []  # [(mtime, token)]

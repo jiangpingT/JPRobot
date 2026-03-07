@@ -53,23 +53,23 @@ class HumanoidVelocityEnv(gym.Wrapper):
     VX_RANGE = (-1.0, 1.2)   # m/s，前进 / 后退（v3: 2.0→1.2，贴近物理上限，消灭追不上的高速命令）
     VY_RANGE = (-0.5, 0.5)   # m/s，横向移动（侧步）
     WZ_RANGE = (-1.0, 1.0)   # rad/s，原地转弯
-    WZ_LEFT_BIAS = 0.7       # v4: 左转（wz>0）采样概率，70%左转 vs 30%右转/直行
+    WZ_LEFT_BIAS = 0.5       # v5: 恢复均匀采样（v4=0.7左转偏置→副作用大，后退退步）
 
     # ── 奖励参数 ───────────────────────────────────────────────────────────
     W_VEL = 5.0               # 速度追踪奖励权重（v2: 3.0→5.0，让追踪比存活更有竞争力）
-    SIGMA = 1.0               # 指数衰减系数（v2: 0.25→1.0，大误差时仍有梯度，不再全0）
-                              # v1 教训：SIGMA=0.25时vel_error=1.639给出reward≈0.004，
-                              # 机器人完全拿不到信号，只能站稳拿存活分。
-                              # v2 分析：SIGMA=1.0时vel_error=1.639给出reward=5*exp(-1.64)≈0.97
-                              # 精准跟随vel_error≈0给出reward≈5.0，差价约4分/步，梯度充分。
+    SIGMA = 1.0               # v6: 恢复1.0（v5 SIGMA=0.75失败，评估vel_error退步0.2）
+                              # 教训：SIGMA改变会造成训练/评估标准不一致，需同步改评估脚本
+                              # 或者维持SIGMA不变，改其他手段提升精度
     WZ_ERROR_WEIGHT = 0.70   # v4: 转弯误差权重（v1-v3: 0.5 → v4: 0.70，加强转弯追踪梯度）
+    W_ERROR_DELTA = 1.0      # v6: 误差变化率奖励权重（误差减小时奖励，增大时惩罚）
+    HISTORY_STEPS = 3        # v7: 保留最近 N 步的速度误差历史，让 agent 看到趋势
 
     # Gymnasium Humanoid-v4 源码中 forward_reward_weight 默认值
     # 参考：gymnasium/envs/mujoco/humanoid_v4.py
     FORWARD_REWARD_WEIGHT = 1.25
 
-    def __init__(self):
-        env = gym.make("Humanoid-v4")
+    def __init__(self, render_mode=None):
+        env = gym.make("Humanoid-v4", render_mode=render_mode)
         super().__init__(env)
 
         # 扩展观测空间：376 → 379
@@ -80,9 +80,14 @@ class HumanoidVelocityEnv(gym.Wrapper):
         cmd_low  = np.array([self.VX_RANGE[0], self.VY_RANGE[0], self.WZ_RANGE[0]], dtype=np.float32)
         cmd_high = np.array([self.VX_RANGE[1], self.VY_RANGE[1], self.WZ_RANGE[1]], dtype=np.float32)
 
+        # v7: 误差历史的边界（误差最大约为命令范围的 2 倍，用 ±3 留余量）
+        hist_low  = np.full(self.HISTORY_STEPS * 3, -3.0, dtype=np.float32)
+        hist_high = np.full(self.HISTORY_STEPS * 3,  3.0, dtype=np.float32)
+
+        # 扩展观测空间：376 + 3(速度命令) + 9(误差历史 3步×3分量) = 388 维
         self.observation_space = spaces.Box(
-            low=np.concatenate([orig_low, cmd_low]),
-            high=np.concatenate([orig_high, cmd_high]),
+            low=np.concatenate([orig_low, cmd_low, hist_low]),
+            high=np.concatenate([orig_high, cmd_high, hist_high]),
             dtype=np.float32,
         )
 
@@ -90,6 +95,10 @@ class HumanoidVelocityEnv(gym.Wrapper):
         self.cmd_vx: float = 0.0
         self.cmd_vy: float = 0.0
         self.cmd_wz: float = 0.0
+        # v6: 上一步的速度误差（用于计算误差变化率）
+        self._prev_vel_error: float = 0.0
+        # v7: 误差历史缓冲区（shape=[HISTORY_STEPS, 3]，每行=[vx_err, vy_err, wz_err]）
+        self._error_history = np.zeros((self.HISTORY_STEPS, 3), dtype=np.float32)
 
     # ── 内部工具 ──────────────────────────────────────────────────────────
 
@@ -109,9 +118,13 @@ class HumanoidVelocityEnv(gym.Wrapper):
             self.cmd_wz = float(self.np_random.uniform(self.WZ_RANGE[0], 0.0))
 
     def _aug_obs(self, obs: np.ndarray) -> np.ndarray:
-        """把速度命令拼接到原始观测末尾，返回 379 维 float32。"""
+        """把速度命令和误差历史拼接到原始观测末尾，返回 388 维 float32。
+
+        结构：[376 原始观测] + [3 速度命令] + [9 误差历史（3步×3分量）]
+        误差历史：最旧的一行在前，最新的一行在末尾（时间序，便于网络学习趋势）
+        """
         cmd = np.array([self.cmd_vx, self.cmd_vy, self.cmd_wz], dtype=np.float32)
-        return np.concatenate([obs.astype(np.float32), cmd])
+        return np.concatenate([obs.astype(np.float32), cmd, self._error_history.flatten()])
 
     def _get_robot_vel(self):
         """从 MuJoCo 状态中读取机器人根节点的线速度和角速度。
@@ -136,6 +149,8 @@ class HumanoidVelocityEnv(gym.Wrapper):
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._sample_cmd()
+        self._prev_vel_error = 0.0  # v6: 每局开始时清零上步误差
+        self._error_history[:] = 0.0  # v7: 每局开始时清空误差历史
         info["vel_cmd"] = (self.cmd_vx, self.cmd_vy, self.cmd_wz)
         return self._aug_obs(obs), info
 
@@ -159,12 +174,26 @@ class HumanoidVelocityEnv(gym.Wrapper):
         # 指数衰减：误差=0 时奖励最大=3.0，误差越大奖励越接近 0
         vel_reward = self.W_VEL * np.exp(-vel_error / self.SIGMA)
 
+        # ── 误差变化率奖励（v6 新增）─────────────────────────────────────────
+        # error_delta > 0 表示误差在增大（变差），< 0 表示误差在减小（变好）
+        # 乘以 -1 后：误差减小 → 正奖励，误差增大 → 负惩罚
+        # 物理含义：鼓励策略"持续向正确方向修正"，而不只是"当前误差有多大"
+        error_delta = vel_error - self._prev_vel_error
+        delta_reward = self.W_ERROR_DELTA * (-error_delta)
+        self._prev_vel_error = vel_error
+
+        # v7: 更新误差历史缓冲区（滚动覆盖最旧一行，写入当前步误差向量）
+        err_vec = np.array([vx - self.cmd_vx, vy - self.cmd_vy, wz - self.cmd_wz], dtype=np.float32)
+        self._error_history = np.roll(self._error_history, -1, axis=0)
+        self._error_history[-1] = err_vec
+
         # 最终奖励：保留原版的存活奖励、健康奖励、能量惩罚等，只换掉前进部分
-        reward = base_reward - original_forward + vel_reward
+        reward = base_reward - original_forward + vel_reward + delta_reward
 
         info["vel_cmd"]    = (self.cmd_vx, self.cmd_vy, self.cmd_wz)
         info["vel_actual"] = (vx, vy, wz)
         info["vel_error"]  = vel_error
         info["vel_reward"] = vel_reward
+        info["delta_reward"] = delta_reward
 
         return self._aug_obs(obs), reward, terminated, truncated, info

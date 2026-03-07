@@ -199,7 +199,7 @@ def train(total_steps: int, n_envs: int, resume_path: str | None = None) -> None
     print(f"人形机器人速度命令跟随训练（万向行走）")
     print(f"  步数: {total_steps/1e6:.1f}M  并行环境: {n_envs}")
     print(f"  算法: SAC（off-policy，样本效率5-10x PPO）")
-    print(f"  环境: HumanoidVelocityEnv（379 维 obs = 376 + 3 速度命令）")
+    print(f"  环境: HumanoidVelocityEnv（388 维 obs = 376 + 3 速度命令 + 9 误差历史[v7]）")
     print(f"  速度命令: vx∈[-1,2] m/s  vy∈[-0.5,0.5] m/s  wz∈[-1,1] rad/s")
     print(f"  奖励: 去掉固定前进奖励，换速度追踪 3.0*exp(-err/0.25)")
     print(f"  SDE: True  ent_coef: auto  buffer: 1M")
@@ -222,14 +222,14 @@ def train(total_steps: int, n_envs: int, resume_path: str | None = None) -> None
     )
 
     if resume_path:
-        print(f"从 checkpoint 续训（obs=379）: {resume_path}")
+        print(f"从 checkpoint 续训（obs=388）: {resume_path}")
         # 先新建 SAC（绑定 env），再把 checkpoint 权重加载进来
         model = SAC("MlpPolicy", vec_env, device="cpu", **SAC_KWARGS)
         loaded = SAC.load(resume_path)
         model.policy.load_state_dict(loaded.policy.state_dict())
         del loaded
     else:
-        print("从零初始化 SAC 策略网络（obs=379）...")
+        print("从零初始化 SAC 策略网络（obs=388，v7 Method A）...")
         model = SAC(
             "MlpPolicy",
             vec_env,
