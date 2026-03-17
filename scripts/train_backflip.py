@@ -37,7 +37,25 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from jprobot.training.env_backflip import BittleBackflipEnv
 
 # ── 目录结构 ──────────────────────────────────────────────────────────────
-TRAINED_DIR     = Path(__file__).parent.parent / "trained" / "backflip_v71"
+TRAINED_DIR     = Path(__file__).parent.parent / "trained" / "backflip_v91"
+TRAINED_DIR_V90 = Path(__file__).parent.parent / "trained" / "backflip_v90"  # V90：ent_coef=0.008+RSI=0.3+GUIDE=3，ep_len190→129（RSI拔河），height=0.022m（best.zip保存在第1分钟）
+TRAINED_DIR_V89 = Path(__file__).parent.parent / "trained" / "backflip_v89"  # V89：3 bug修复版（RSI/else分支/基线），100%成功，rot=360.7°，height=0.022m（策略冻结，ent_coef=0.005不足探索）
+TRAINED_DIR_V88 = Path(__file__).parent.parent / "trained" / "backflip_v88"  # V88：obs迁移V64(23→24)失败，ep_len=12全程不恢复，根因：权重迁移零初始化+RSI success_flag混淆
+TRAINED_DIR_V85 = Path(__file__).parent.parent / "trained" / "backflip_v85"  # V85：W_POST_ACTION_GUIDE=500（动作空间引导），height仍0.022m（best.zip保存在训练第1步，之后退化）
+TRAINED_DIR_V84 = Path(__file__).parent.parent / "trained" / "backflip_v84"  # V84：近站姿RSI+W_POST_HEIGHT=5000，height仍0.022m（Critic学会但Actor无法泛化到lying→standing）
+TRAINED_DIR_V83 = Path(__file__).parent.parent / "trained" / "backflip_v83"  # V83：W_POST_STAND_GUIDE=30→ep_len=151（随机后空翻被污染），高度仍0.022m（均值动作未变）
+TRAINED_DIR_V82 = Path(__file__).parent.parent / "trained" / "backflip_v82"  # V82：W_POST_HEIGHT_VEL=100000+ent_coef=0.020，ep_rew=129K→高度仍0.022m（随机上升但均值动作仍趴地）
+TRAINED_DIR_V81 = Path(__file__).parent.parent / "trained" / "backflip_v81"  # V81：RSI_GETUP=0.3，ep_rew=110650→高度仍0.022m（RSI提供训练机会但无法打破"趴地局部最优"）
+TRAINED_DIR_V80 = Path(__file__).parent.parent / "trained" / "backflip_v80"  # V80：obs_dim=24+success_flag，ep_rew=89529→高度仍0.022m（梯度存在但探索不足，需RSI提供站立练习机会）
+TRAINED_DIR_V79 = Path(__file__).parent.parent / "trained" / "backflip_v79"  # V79：POST_SUCCESS=400步，W=2000，ep_rew=131289→高度仍0.022m（aliasing问题！obs无success_flag，网络无法区分后空翻与站立阶段）
+TRAINED_DIR_V78 = Path(__file__).parent.parent / "trained" / "backflip_v78"  # V78：W_POST_GUIDE=0，W_POST_HEIGHT=2000，POST_SUCCESS=40→高度仍0.022m（40步不够，需500步物理）
+TRAINED_DIR_V77 = Path(__file__).parent.parent / "trained" / "backflip_v77"  # V77：W_POST_GUIDE=50线性→V64退步！backflip奖励8502→6967，高度0.052→0.022m（线性惩罚干扰共享网络）
+TRAINED_DIR_V76 = Path(__file__).parent.parent / "trained" / "backflip_v76"  # V76：ent_coef=0.005，ep_len从120→62（RSI破坏后空翻！RSI与高W_POST_GUIDE共享网络=根本原因）
+TRAINED_DIR_V75 = Path(__file__).parent.parent / "trained" / "backflip_v75"  # V75：W_POST_GUIDE=100，ep_rew -1418→+899→-1418（RSI从-6343→-194，partial standing！）但5M不够收敛
+TRAINED_DIR_V74 = Path(__file__).parent.parent / "trained" / "backflip_v74"  # V74：post_guide Gaussian→Linear(-pose_diff/20)，W_POST_GUIDE=50，ep_rew 3301→4876，但5M步不够收敛，height=0.0226m
+TRAINED_DIR_V73 = Path(__file__).parent.parent / "trained" / "backflip_v73"  # V73：50%RSI+50%完整后空翻，ep_len=180✅但height=0.0226m（post_guide Gaussian梯度消失=根本原因）
+TRAINED_DIR_V72 = Path(__file__).parent.parent / "trained" / "backflip_v72"  # V72：RSI关节对齐真实落地状态，但RSI_GETUP=100%导致训练-评估分布漂移，height=0.0226m
+TRAINED_DIR_V71 = Path(__file__).parent.parent / "trained" / "backflip_v71"  # V71：RSI_GETUP 100%，height=0.0226m（RSI初始关节与实际落地关节不匹配=根本原因）
 TRAINED_DIR_V70 = Path(__file__).parent.parent / "trained" / "backflip_v70"  # V70：RSI_GETUP 60%，height=0.0226m，仍固化（所有版本落地高度一致=0.0226m）
 TRAINED_DIR_V69 = Path(__file__).parent.parent / "trained" / "backflip_v69"  # V69：从V64热启（打破固化链），height_ratio=0.00，body=0.0226m，仍固化（±0°）
 TRAINED_DIR_V68 = Path(__file__).parent.parent / "trained" / "backflip_v68"  # V68：ent_coef=0.015+基线0.01修复，height_ratio=0.00，仍固化（±0°）
@@ -68,29 +86,36 @@ TRAINED_DIR_V60 = Path(__file__).parent.parent / "trained" / "backflip_v60"  # V
 #     gaming 286°直立落地: W_SUCCESS×2.5 + 0 = 2500（差于V43现状，无gaming动机）
 #   从 V43 热启（rotation=338.9°，各版本最高，最接近360°目标）。
 #   ent_coef=0.003（恢复标准，V45高探索反而退步）。
+# v91 oracle衰减课程：5个子阶段，每阶段1M步，oracle从0.7线性衰减到0.0。
+# 格式：(stage_name, timesteps, ent_coef, oracle_blend)
+# oracle_blend 物理含义：执行动作 = (1-blend)×policy + blend×STANDING_TARGET_RAD
+#   blend=0.7：机器人物理上站起来（oracle主导），Critic见到"站立=高奖励"打破死锁。
+#   blend=0.0：策略完全自主，oracle完全退出（诚实评估用这一阶段的best.zip）。
+# 热启：V89 full/best.zip（100%成功，rot=360.7°，obs=24原生）
+# 注意：每个阶段目录不同（o70/o50/o30/o10/o00），训练_phase强制"full"（在main中覆盖）。
 CURRICULUM = [
-    ("full", 5_000_000, 0.010),   # v71：RSI_GETUP_PROB 100%，专门训练恢复策略，从 V64 热启动。
-                                   # V68 评估结果：height_ratio=0.00，策略固化±0°
-                                   # 根因：V65-V68 形成"固化链"（每次从已固化版本热启），
-                                   #   ent_coef 提到 0.015 仍无法打破，说明局部最优极深。
-                                   # 策略：跳过固化链，回到 V64（固化链前唯一有进展的版本）。
-                                   #   V64 height_ratio=0.20，body=0.052m，是真实有进展的热启点。
-                                   # ent_coef=0.010：比 V64 的 0.006 高（需要更多探索），
-                                   #   但比 V68 的 0.015 低（避免过强导致退步）。
-                                   # W_POST_HEIGHT 同步从 100→200（env_backflip.py中修改）。
+    ("o70", 1_000_000, 0.005, 0.70),  # oracle=70%，机器人物理上站起来，Critic学习站立价值
+    ("o50", 1_000_000, 0.005, 0.50),  # oracle=50%，策略开始分担，价值函数梯度指向站立
+    ("o30", 1_000_000, 0.005, 0.30),  # oracle=30%，策略主导，oracle仅作辅助矫正
+    ("o10", 1_000_000, 0.005, 0.10),  # oracle=10%，几乎完全自主，轻微oracle防止跌出
+    ("o00", 1_000_000, 0.005, 0.00),  # oracle=0%，完全自主站立！诚实评估用此阶段best.zip
 ]
 
-STAGE_ORDER = ["full"]  # 单 full 阶段，从 V64 full/best.zip 热启动（打破固化链）
+STAGE_ORDER = ["o70", "o50", "o30", "o10", "o00"]  # 5阶段oracle衰减课程
 
 
-_STAGE_LABELS = {"jump": "起跳", "rotate": "旋转", "land": "落地", "full": "完整"}
+_STAGE_LABELS = {
+    "jump": "起跳", "rotate": "旋转", "land": "落地", "full": "完整",
+    "o70": "Oracle70%", "o50": "Oracle50%", "o30": "Oracle30%",
+    "o10": "Oracle10%", "o00": "Oracle0%(诚实)",
+}
 
 # 从 CURRICULUM 自动推导，避免手动同步出错
-_STAGE_TOTAL_STEPS      = {s: t for s, t, _ in CURRICULUM}
-_TOTAL_STEPS            = sum(t for _, t, _ in CURRICULUM)          # 9_000_000
+_STAGE_TOTAL_STEPS      = {s: t for s, t, _, _b in CURRICULUM}
+_TOTAL_STEPS            = sum(t for _, t, _, _b in CURRICULUM)
 _CURRICULUM_CUMULATIVE  = {}
 _cumsum = 0
-for _s, _t, _ in CURRICULUM:
+for _s, _t, _, _b in CURRICULUM:
     _cumsum += _t
     _CURRICULUM_CUMULATIVE[_s] = _cumsum
 
@@ -280,15 +305,23 @@ class BackflipProgressCallback(BaseCallback):
 
 
 def train_stage(stage: str, timesteps: int, ent_coef: float,
-                resume_path: Path | None, n_envs: int) -> Path:
-    """训练单个课程阶段，返回最终模型路径。"""
+                resume_path: Path | None, n_envs: int,
+                oracle_blend: float = 0.0,
+                training_phase: str = None) -> Path:
+    """训练单个课程阶段，返回最终模型路径。
+
+    oracle_blend: v91新增。0.0=无oracle（默认），0.7=70%站立目标混入动作。
+    training_phase: 控制奖励模式，默认等于stage名；v91子阶段需强制传"full"。
+    """
+    if training_phase is None:
+        training_phase = stage
 
     out_dir = TRAINED_DIR / stage
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
     print(f"阶段 [{stage}]  目标: {timesteps/1e6:.1f}M 步  "
-          f"ent_coef={ent_coef}  n_envs={n_envs}")
+          f"ent_coef={ent_coef}  oracle_blend={oracle_blend}  n_envs={n_envs}")
     if resume_path:
         print(f"续训模型: {resume_path}")
     print(f"输出目录: {out_dir}")
@@ -300,14 +333,54 @@ def train_stage(stage: str, timesteps: int, ent_coef: float,
     vec_env = make_vec_env(
         BittleBackflipEnv,
         n_envs=n_envs,
-        env_kwargs={"render_mode": None, "training_phase": stage},
+        env_kwargs={"render_mode": None, "training_phase": training_phase,
+                    "oracle_blend": oracle_blend},
         vec_env_cls=SubprocVecEnv,
     )
 
     # 加载或新建模型
     if resume_path and resume_path.exists():
         print(f"加载模型: {resume_path}")
-        model = PPO.load(resume_path, env=vec_env, device="cpu", ent_coef=ent_coef)
+        # obs 维度兼容处理：老模型(obs=23)→新 env(obs=24)，先不传 env 加载权重，
+        # 再通过 set_env 挂载新环境（SB3 会 reshape 策略输入层）。
+        # 背景：V80 新增 success_flag 使 obs 从 23→24，V64 及更早为 23 维。
+        try:
+            model = PPO.load(resume_path, env=vec_env, device="cpu", ent_coef=ent_coef)
+        except ValueError as e:
+            if "Observation spaces do not match" in str(e):
+                print(f"  [compat] obs 维度不匹配，用权重迁移方式热启动...")
+                old_model = PPO.load(resume_path, device="cpu")
+                old_obs_dim = old_model.observation_space.shape[0]
+                new_obs_dim = vec_env.observation_space.shape[0]
+                print(f"  [compat] 老模型 obs={old_obs_dim}，新 env obs={new_obs_dim}")
+                # 新建同架构模型，将老权重复制到兼容层
+                model = PPO(
+                    "MlpPolicy", vec_env,
+                    verbose=0, device="cpu",
+                    n_steps=2048, batch_size=256, n_epochs=10,
+                    learning_rate=3e-4, ent_coef=ent_coef,
+                    gamma=0.99, gae_lambda=0.95, clip_range=0.2,
+                    policy_kwargs=dict(net_arch=[256, 256]),
+                    seed=42,
+                )
+                # 复制 value/policy 网络权重（除第一层外），第一层维度不匹配需截断
+                import torch
+                old_sd = old_model.policy.state_dict()
+                new_sd = model.policy.state_dict()
+                for k in new_sd:
+                    if k in old_sd and new_sd[k].shape == old_sd[k].shape:
+                        new_sd[k] = old_sd[k]
+                    elif k in old_sd and len(new_sd[k].shape) == 2 and new_sd[k].shape[1] != old_sd[k].shape[1]:
+                        # 第一层 weight: [hidden, obs_dim]，截断/填充 obs 维
+                        w_old = old_sd[k]  # [256, 23]
+                        w_new = new_sd[k].clone()  # [256, 24]，随机初始化
+                        w_new[:, :old_obs_dim] = w_old[:, :old_obs_dim]
+                        new_sd[k] = w_new
+                        print(f"  [compat] 层 {k}: {tuple(w_old.shape)}→{tuple(w_new.shape)}（新增维度随机初始化）")
+                model.policy.load_state_dict(new_sd)
+                print(f"  [compat] 权重迁移完成，新 obs 维度用零初始化权重")
+            else:
+                raise
     else:
         print("从头初始化模型")
         model = PPO(
@@ -341,7 +414,9 @@ def train_stage(stage: str, timesteps: int, ent_coef: float,
     model.learn(
         total_timesteps=timesteps,
         callback=[progress_cb, checkpoint_cb],
-        reset_num_timesteps=(resume_path is None),
+        reset_num_timesteps=True,   # v90修复：始终重置步数，热启也从步数0开始计满 total_timesteps 步。
+                                    # 原来：`resume_path is None` → 热启时不重置→继承V89内部步数(≈4.37M)→只训练≈630K步！
+                                    # 重要：ent_coef 是固定值（不随步数衰减），reset不影响策略质量。
         progress_bar=True,
     )
 
@@ -391,36 +466,47 @@ def main():
     print(f"device: cpu（MPS 对小网络反而慢 2.3×，详见 /tmp/mps_bench.py）")
 
     if args.stage == "all":
-        # v71 热启动：从 V64 full/best.zip，RSI_GETUP_PROB 100% 专门训练恢复策略。
-        # V70 诊断：60%RSI仍然height=0.0226m。重大发现：所有版本落地高度=0.0226m，
-        #   V64的"height_ratio=0.20"是旧评估脚本假象，实际也是0.0226m。
-        # 策略转变：后空翻policy已成熟（V64完美落地），本轮只训练恢复能力。
-        # V71：RSI_GETUP_PROB=1.00（100%趴地），每局直接从趴地练站立。
-        # 物理验证：PD控制可从0.04m达到0.089m，证明物理可行，只是RL未学到。
-        v64_warm = TRAINED_DIR_V64 / "full" / "best.zip"
+        # v86：动作混合（POST_SUCCESS_ACTION_BLEND=0.70）——物理辅助站立突破！
+        # v85复盘：动作空间引导和所有以往reward都面临同一问题：
+        #   任何post-success梯度→随机后空翻退化→best.zip保存在训练第1步→eval永远是初始状态。
+        # v86根本解法：不依赖梯度改变policy行为，而是直接在env.step()中混合动作。
+        #   执行动作 = 0.30×policy + 0.70×STANDING_TARGET_RAD（物理混合！）
+        #   机器人物理上站起来→奖励飙升→PPO强化这个路径→policy学习站立行为。
+        # 物理验证：oracle命令[50°,0°,...]400步→机器人确实站立（test_actual_landing.py）。
+        # 热启：V85 best.zip（V85训练首步保存=基本等于V84，后空翻100%，rotation≈375°）。
+        v89_best = TRAINED_DIR_V89 / "full" / "best.zip"
         if args.resume:
             prev_model = args.resume
-        elif v64_warm.exists():
-            prev_model = v64_warm
-            print(f"[V71] full 阶段将从 V64 full/best.zip 热启动: {v64_warm}")
-            print(f"[V71] RSI_GETUP_PROB=1.00（100%趴地，专门训练恢复策略）")
-            print(f"[V71] ent_coef=0.010，W_POST_HEIGHT=200（保持）")
+        elif v89_best.exists():
+            prev_model = v89_best
+            print(f"[V91] 从 V89 full/best.zip 热启动: {v89_best}")
+            print(f"[V91] V89：100%成功，rot=360.7°，height=0.022m（趴地冻结）")
+            print(f"[V91] oracle衰减课程：0.7→0.5→0.3→0.1→0.0，每阶段1M步")
         else:
             prev_model = None
-            print("[V71] 未找到 V64 full/best.zip，full 阶段从头训练")
+            print("[V91] 未找到V89 best.zip，从头训练（不推荐）")
 
-        for stage, timesteps, ent_coef in CURRICULUM:
-            best = train_stage(stage, timesteps, ent_coef, prev_model, args.envs)
+        for stage, timesteps, ent_coef, oracle_blend in CURRICULUM:
+            best = train_stage(stage, timesteps, ent_coef, prev_model, args.envs,
+                               oracle_blend=oracle_blend, training_phase="full")
             if not args.no_eval:
                 eval_stage(stage, best)
             prev_model = best
-        print("\n[V71] 完整课程训练结束！")
-        print(f"最终模型: {TRAINED_DIR / 'full' / 'best.zip'}")
-        print(f"验收报告: {TRAINED_DIR / 'full' / 'fixed_eval.json'}")
+        print("\n[V91] oracle衰减课程训练结束！")
+        print(f"最终模型（诚实）: {TRAINED_DIR / 'o00' / 'best.zip'}")
+        print(f"验收报告: {TRAINED_DIR / 'o00' / 'fixed_eval.json'}")
     else:
-        stage_cfg = {s: (t, e) for s, t, e in CURRICULUM}
-        timesteps, ent_coef = stage_cfg[args.stage]
-        best = train_stage(args.stage, timesteps, ent_coef, args.resume, args.envs)
+        stage_cfg = {s: (t, e, b) for s, t, e, b in CURRICULUM}
+        timesteps, ent_coef, oracle_blend = stage_cfg[args.stage]
+        # V91：--stage 单阶段也支持从 V89 热启（首阶段 o70）
+        resume = args.resume
+        if resume is None and args.stage == "o70":
+            v89_best = TRAINED_DIR_V89 / "full" / "best.zip"
+            if v89_best.exists():
+                resume = v89_best
+                print(f"[V91] --stage o70：自动使用 V89 best.zip 热启: {resume}")
+        best = train_stage(args.stage, timesteps, ent_coef, resume, args.envs,
+                           oracle_blend=oracle_blend, training_phase="full")
         if not args.no_eval:
             eval_stage(args.stage, best)
 

@@ -23,13 +23,14 @@
     shoulder/hip = 靠近身体的关节（近端）
     knee = 远端关节
 
-观测空间（23 维）：
+观测空间（24 维）：v80 新增第24维 success_flag，解决策略无法区分"后空翻落地"与"站立阶段"的根本问题。
   [0:4]   body_quaternion    机体四元数（描述空间姿态，不同于欧拉角，不会万向锁）
   [4:7]   body_ang_velocity  机体角速度 rad/s（检测旋转速率，是关键信号）
   [7:10]  body_lin_velocity  机体线速度 m/s（vz > 0 = 起跳中，< 0 = 下落中）
   [10]    height             离地高度 m（> 0.12 = 腾空）
   [11:19] joint_angles_norm  8 个关节角归一化到 [-1, 1]
   [19:23] foot_contacts      4 只脚的触地状态（1=接触，0=离地）
+  [23]    success_flag       v80新增：后空翻成功=1.0，否则=0.0。让策略区分"翻转阶段"与"站立阶段"。
 
 动作空间（8 维，连续 [-1, 1]）：
   直接映射到关节目标角度 [-110°, +110°]。
@@ -47,8 +48,10 @@ import pybullet_data
 
 
 # ── 物理仿真参数 ──────────────────────────────────────────────────────────
-EPISODE_LENGTH = 200        # v65：120→200。后空翻~60步 + post-success~120步 ≈ 180步，需扩容。
-                            # v64及以前=120（40步post-success），v65新增120步post-success超出原上限。
+EPISODE_LENGTH = 420        # v90：250→420。POST_SUCCESS_STEPS=300 + 后空翻~60步 + buffer = 420。
+                            # v88：600→250。去掉 oracle（500步 blend）后，后空翻~60步 + 策略自主站立~190步足够。
+                            # v87：500→600。后空翻~60步 + post-success~500步 = 560步，扩容以容纳完整站立阶段。
+                            # 旧版：v65=200（40→120步），v64及以前=120（40步post-success）。
 JOINT_LIMIT    = 110        # 关节角度限制（度）
 MOTOR_FORCE    = 4.5        # 电机力矩 N·m（v25: 4.5N·m 从零开始完整课程）
                             # v11: 3.0→4.0。v21-v22 实验：从 V19(4.0N·m) 热启动切换到 4.5N·m → 三轮均退步。
@@ -83,6 +86,15 @@ BF_FRAMES_RAD = np.deg2rad([
     [ 54, -44,  54, -44,   82, -50,  82, -50],  # 帧3: 伸腿准备落地
     [ 30,  30,  30,  30,   30,  30,  30,  30],  # 帧4: 站稳收势
 ])
+
+# v83: 标准站立关节目标（shoulder=50°, knee=0°，与env初始姿态一致）
+# 用于 W_POST_STAND_GUIDE（关节角空间引导）和 W_POST_ACTION_GUIDE（动作空间引导）。
+STANDING_TARGET_RAD = np.deg2rad([50, 0, 50, 0, 50, 0, 50, 0])
+
+# v85: 动作空间中的站立目标（归一化到 [-1,1]，与动作空间一致）
+# action = joint_angle / JOINT_LIMIT(rad) → 50°/110° = 0.4545, 0°/110° = 0.0
+# 用于 W_POST_ACTION_GUIDE：直接奖励 policy 输出接近站立目标的动作（bypasses 物理延迟）。
+STANDING_ACTION_NORM = np.array([50/110, 0, 50/110, 0, 50/110, 0, 50/110, 0], dtype=np.float32)
 
 # ── 奖励权重 ──────────────────────────────────────────────────────────────
 W_JUMP        = 5.0   # 起跳阶段：奖励向上速度（v2→v3：3.0→5.0，v2 jump 0% 的直接修复）
@@ -163,23 +175,62 @@ W_POST_STAND    = 50.0  # v63 再加强：成功后站稳奖励（每步）25→
                          # v62 诊断：uprightness只测pitch/roll角度，不区分"贴地趴"和"四腿站立"。
                          # v63 成果：uprightness≈0.95但机器人是趴在地上（pitch≈0 = 水平 = 骗分！）
                          # anti-gaming 安全：必须先完成后空翻才能触发，无法绕过。
-W_POST_HEIGHT   = 200.0 # v69 提升：100→200（2倍），打破固化链后强化高度梯度。
+W_POST_HEIGHT   = 5000.0 # v84: 2000→5000，增强高度梯度信号。v78/v79：纯高度激励（去除W_POST_GUIDE）。
+                         # v79（POST_SUCCESS=400步）：躺平=2000×0.139×400=111200/局，站立=800000/局，差值688800！
                          # height_ratio: height<0.01m(贴地)=0，≥0.10m(正常站高)=1.0，线性插值。
-                         # 200分/步×120步=24000分最大高度奖励（vs v68: 100×120=12000），强力激励起身。
 W_POST_FEET     = 5.0   # v65 新增：成功后每只脚着地奖励（每步）。
+W_POST_HEIGHT_VEL = 200000.0  # v84: 100000→200000，加强高度速度奖励。v82 新增：成功后高度上升速度奖励（每步）。
+W_POST_STAND_GUIDE = 0.0      # v91：3.0→0.0。oracle衰减自己提供站立方向，关节引导属于额外噪音。
+                               # v90：0→3.0（轻量关节引导）。v90诊断：未能打破冻结，且与oracle方向可能矛盾。
+                               # v85: 5→0，完全移除关节角空间引导（已被动作空间引导取代）。
+W_POST_ACTION_GUIDE = 0.0     # v86: 500→0，动作空间引导也已归零（由 action_blend 取代）。
+                               # v85 教训：动作空间引导与 action_blend 相比效果弱，且仍造成随机后空翻退化。
+POST_SUCCESS_ACTION_BLEND = 0.00  # v89（继承v88）：完全无 oracle。策略必须自己学会站立。
+                                   # v87教训：100% oracle让指标好看（ratio=0.866）但是幻觉——
+                                   #   robot被冻在pitch=-52°的半倒姿势，不是真正站立。
+                                   # v88教训：baseline=0.05m但V80落点=0.022m < 0.05m，梯度=0！
+                                   # v89修复：baseline改回0.01m，覆盖V80自然落点0.022m（ratio=0.133有梯度）。
+                               # 问题根因：policy 在 post-success 时输出动作≈落地关节（局部最优）。
+                               # 以往所有引导（HEIGHT_VEL/STAND_GUIDE）都等物理现象→延迟太大→梯度弱。
+                               # v85 解法：直接奖励 policy 输出站立目标动作，绕过伺服物理延迟。
+                               # 公式：W × exp(-2 × ||action - STANDING_ACTION_NORM||²)
+                               #   action=落地动作: exp(-2×2.41)=0.008, bonus=4/步（弱）
+                               #   action=站立动作: exp(-2×0)=1.0, bonus=500/步（强！）
+                               #   差值=496/步×400步=198K梯度差价 → 直接推动policy输出站立动作
+                               # 关键优势：梯度在 backprop 中直接作用于 policy 参数，无需等待物理收敛。
+                               # 当 policy 输出站立动作时，伺服系统自然驱动关节→站立→体高增加→额外奖励。
+                               # oracle验证：命令[50°,0°,...]400步→机器人确实站立（test_actual_landing.py）。
+                                # 公式：max(0, dh) × W，dh=本步高度变化。打破"趴地局部最优"！
+                                # v81根因：height_ratio=0.14@0.022m=289/step，策略趴着不动就稳拿。
+                                # v82机制：只要向上运动就有额外奖励（哪怕1mm=100），彻底消灭趴地局部最优。
+                                # 上升68mm全过程：100000×0.068=6800总额外奖励（vs趴地=0额外奖励）。
+                                # 路径无关：无论中间经历多少下降，NET上升运动都被激励。
                          # 4脚全着地=20分/步×120步=2400分，鼓励用脚撑地抬身体而非翻滚。
-W_POST_GUIDE    = 15.0  # v65 新增：成功后pose-guide增强（vs 全局W_POSE_GUIDE=4.0）。
-                         # 15分 × exp(-0.5×关节角差²)，强引导向BF_FRAMES_RAD[4]（站稳姿态30°×8）。
-                         # 120步满分=1800分，教机器人"站立时腿应该是什么角度"。
-POST_SUCCESS_STEPS = 120 # v65：40→120（3倍，约2.5秒），机器人有足够时间完成起身动作序列。
-                         # v64 根因：40步≈0.83秒太短，"贴地趴→站立"是复杂运动序列，需要更多时间。
-                         # 配套：EPISODE_LENGTH 同步扩容到200（后空翻~60步+120步post=~180步）。
-RSI_GETUP_PROB  = 1.00  # v71：100%趴地专练恢复策略。
-                         # V70诊断：60%RSI仍然height=0.0226m，所有版本落地高度一致=0.0226m。
-                         # 根本策略转变：后空翻policy已成熟（V64），单独训练恢复policy。
-                         # 100%RSI_GETUP：每局直接从趴地开始，完全聚焦站立恢复技能训练。
-                         # 从V64热启保留后空翻基础，但本次只强化恢复能力。
-                         # 注：评估时disable_rsi=True，所以评估仍走完整后空翻流程验证。
+W_POST_GUIDE    = 0.0   # v78：彻底移除（归零）。v77教训：线性惩罚(-pose_diff/20)导致回归！
+                         # v77分析：backflip奖励从v64的8502退步到6967（-1535！）。
+                         # 根因：线性惩罚干扰落地后关节，共享网络学到"落地就移向目标关节"，
+                         #   破坏了backflip落地相的动作，降低了backflip质量和站立高度。
+                         # v78策略：只用高度激励（W_POST_HEIGHT=2000），简单纯粹，不干扰关节动作。
+                         #   梯度差值=36343/episode=303/步，极强驱动力！
+                         # 公式(继承v74): post_guide = -pose_diff/20.0
+                         #   落地(pose_diff=17.74): guide=-0.887 → -88.7/步（强惩罚！）
+                         #   站立(pose_diff≈0):     guide=0      → 奖励最大化
+POST_SUCCESS_STEPS = 5   # demo：300→5。落地后展示 0.1s（5步×0.02s），有始有终再重置。
+                         # 0步太突兀（落地即消失），5步刚好让观众看清"稳稳落地"再开下一局。
+                         # 训练用值：v91=300，v90=300，v89=190。恢复训练时改回对应版本的值。
+RSI_GETUP_PROB  = 0.0   # v91：0.3→0.0。RSI与共享网络不兼容的根本问题再次确认：
+                         # v90诊断：ep_len从190降到129，backflip退化，best.zip保存在训练第1分钟。
+                         # 根因：30% RSI episode的梯度与backflip episode梯度拔河→两个任务都学不好。
+                         # v91改用oracle衰减（而非RSI）提供"站立练习"，不干扰后空翻。
+                         # V89策略：完全关闭RSI_GETUP，让V80的后空翻技能完整运行，
+                         #   通过post-success height_ratio梯度（基线0.01m）推动自然站立。
+                         # 如果V89学会后空翻+部分站立，V90再重新引入小概率RSI_GETUP。
+                         # v84: 0.3→0.5，更多站立练习（50%的getup RSI中，一半是近站姿）。
+RSI_NEAR_STAND_PROB = 0.5  # v84 新增：getup RSI中近站姿RSI的概率（0.5=50%趴地+50%近站姿）。
+                            # 近站姿RSI(_near_stand_rsi_init)：body在0.07-0.09m，joints≈[50°,0°,...]±15°。
+                            # 核心作用：填补Critic在lying→standing路径上的价值函数空白。
+                            # 机制：Critic见到"h=0.08m+站立关节→高奖励"，自然学会中间状态的价值梯度。
+                            # 这给Actor一条清晰的价值梯度路径：从lying(低价值)→near-standing(高价值)。
 W_OVERROT     = 500.0 # v37 新增：超旋转惩罚（每步 × 超过360°的弧度量）。
                        # v36 教训：W_OVERSPIN=5（阈值8r/s）物理上不可行！
                        #   物理约束：完成286°需要≥11.5 r/s（0.235m跳高+腾空时间）。
@@ -238,7 +289,7 @@ class BittleBackflipEnv(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"]}
 
-    def __init__(self, render_mode=None, training_phase="full", disable_rsi=False):
+    def __init__(self, render_mode=None, training_phase="full", disable_rsi=False, oracle_blend=None):
         """
         training_phase 控制哪些奖励项生效（课程学习用）：
           "jump"   : 只奖励起跳高度（第一阶段）
@@ -247,14 +298,22 @@ class BittleBackflipEnv(gym.Env):
           "full"   : 所有奖励 + 成功 bonus（第四阶段/最终）
 
         disable_rsi: True = 关闭随机空中初始化（评估时用，确保从地面起跳）
+
+        oracle_blend: v91 oracle衰减课程。
+          None = 使用全局常量 POST_SUCCESS_ACTION_BLEND（当前=0.0，无oracle）。
+          0.0~0.7 = 成功后动作混合比例：执行动作 = (1-blend)×policy + blend×STANDING_TARGET_RAD。
+          物理效果：blend=0.7时机器人物理上站起来，让Critic见到成功站立=高奖励的轨迹。
+          学习机制：随blend逐步降低，策略必须承担越来越多的站立工作，最终完全自主。
         """
         super().__init__()
 
         self.render_mode = render_mode
         self.training_phase = training_phase
         self.disable_rsi = disable_rsi
+        # v91：oracle衰减。None→使用全局常量（0.0=无oracle）；0.0~0.7→逐步减小
+        self._oracle_blend = oracle_blend if oracle_blend is not None else POST_SUCCESS_ACTION_BLEND
 
-        obs_dim = 4 + 3 + 3 + 1 + 8 + 4  # = 23
+        obs_dim = 4 + 3 + 3 + 1 + 8 + 4 + 1  # = 24（v80新增 success_flag，让策略区分翻转阶段 vs 站立阶段）
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
@@ -280,6 +339,7 @@ class BittleBackflipEnv(gym.Env):
         self._prev_max_rot_airborne   = 0.0    # 腾空后已达到的最大累积旋转量（rad，单调递增）
         self._rsi_actual_pitch        = 0.0    # RSI 真实俯仰角（rad），v18：超过 ±π 时 Euler 回读错误，用存储值
         self._is_getup_episode        = False  # v66：True = 本局为纯起身训练（跳过后空翻直接练站立）
+        self._prev_post_height        = 0.0    # v82：上一步post-success高度（用于高度速度奖励）
 
         self.urdf_path = os.path.join(
             os.path.dirname(__file__), "..", "models", "bittle_esp32.urdf"
@@ -337,13 +397,18 @@ class BittleBackflipEnv(gym.Env):
         _use_getup_rsi = (not self.disable_rsi
                           and self.training_phase == "full"
                           and np.random.random() < RSI_GETUP_PROB)
+        # v84: getup RSI 内部随机：50%趴地(prone)，50%近站姿(near-standing)
+        _use_near_stand_rsi = _use_getup_rsi and np.random.random() < RSI_NEAR_STAND_PROB
         _use_rsi = (not _use_getup_rsi  # 与趴地RSI互斥
                     and not self.disable_rsi
                     and self.training_phase in ("rotate", "full")
                     and np.random.random() < 0.25)
 
         if _use_getup_rsi:
-            self._prone_rsi_init()
+            if _use_near_stand_rsi:
+                self._near_stand_rsi_init()   # v84: 近站姿RSI（填补Critic价值盲区）
+            else:
+                self._prone_rsi_init()
         elif _use_rsi:
             self._rsi_init()
         else:
@@ -368,6 +433,7 @@ class BittleBackflipEnv(gym.Env):
         self._milestones_hit         = set()
         self._prev_max_rot_airborne  = 0.0
         self._is_getup_episode       = False  # v66：趴地RSI episode标记
+        self._prev_post_height       = 0.0   # v82：高度速度奖励用
 
         _, orn = p.getBasePositionAndOrientation(
             self.robot_id, physicsClientId=self.physics_client
@@ -418,6 +484,18 @@ class BittleBackflipEnv(gym.Env):
         # 动作 → 关节目标角度（直接位置控制，非增量）
         # action ∈ [-1, 1] → target ∈ [-110°, +110°]
         target_angs = np.clip(action, -1.0, 1.0) * self._bound_ang
+
+        # v86: Post-success 动作混合（Action Blending）
+        # 在成功后站立阶段，将 policy 输出与站立目标混合：
+        #   执行动作 = (1-blend)×policy + blend×站立目标
+        # 物理效果：servo 被驱动朝站立方向，机器人从趴地升到站立高度。
+        # 关键：不干扰后空翻阶段（only when self._success=True）。
+        if self._success and self._post_success_steps < POST_SUCCESS_STEPS:
+            # v91 oracle衰减：self._oracle_blend 由训练脚本按阶段注入（0.7→0.0）。
+            # 物理作用：blend=0.7时，执行动作的70%是"站立目标"，机器人物理上站起来。
+            # 学习效果：Critic见到"post-success状态→站立动作→高奖励"，打破价值估算死锁。
+            target_angs = ((1.0 - self._oracle_blend) * target_angs
+                         + self._oracle_blend * STANDING_TARGET_RAD)
 
         # 高力矩位置控制（后空翻需要爆发力）
         # v14 实验：腾空期间 force=0（零力矩）—— 未改善旋转量（65°→63°）。
@@ -654,14 +732,35 @@ class BittleBackflipEnv(gym.Env):
         if self.training_phase == "full" and self._success:
             if self._post_success_steps < POST_SUCCESS_STEPS:
                 uprightness_now = math.exp(-2.0 * (pitch ** 2 + roll ** 2))
-                height_ratio = min(1.0, max(0.0, (height - 0.01) / (0.10 - 0.01)))  # v68: 基线0.04→0.01，修梯度盲区
+                height_ratio = min(1.0, max(0.0, (height - 0.01) / (0.10 - 0.01)))  # v89: 基线0.05→0.01，覆盖V80自然落点(0.022m)
+                                                                                      # v88教训：V80落点0.022m < 0.05m基线，梯度=0！
+                                                                                      # 0.01基线：@0.022m→ratio=0.133，全程有梯度
                 feet_ratio = n_feet / 4.0
                 pose_diff = float(np.sum((current_joints - BF_FRAMES_RAD[4]) ** 2))
-                post_guide = math.exp(-0.5 * pose_diff)
+                post_guide = -pose_diff / 20.0  # v74: 线性负距离（替代Gaussian），始终有梯度。落地时≈-0.887，站立时≈0
+                # v82: 高度速度奖励（向上运动一次性奖励，打破趴地局部最优）
+                if self._post_success_steps == 0:
+                    self._prev_post_height = height  # 初始化：记录第一步高度
+                dh = height - self._prev_post_height
+                self._prev_post_height = height
+                height_vel_bonus = W_POST_HEIGHT_VEL * max(0.0, dh)
+                # v83: 站立关节引导奖励（关节角空间，已降至5→v85=0）
+                stand_pose_diff = float(np.sum((current_joints - STANDING_TARGET_RAD) ** 2))
+                stand_guide_bonus = W_POST_STAND_GUIDE * (-stand_pose_diff / 20.0)
+                # v85: 动作空间站立引导（直接梯度！绕过物理伺服延迟）
+                # 奖励 policy 输出接近站立目标的动作：action≈[0.45,0,...]获得最高bonus
+                # 当policy输出站立动作时→伺服系统驱动关节→关节到达站立位→体高上升→额外奖励
+                # 梯度链：dR/d(action) 直接在 backprop 中作用，无需等待物理收敛
+                action_norm = np.clip(action, -1.0, 1.0).astype(np.float32)
+                action_dist = float(np.sum((action_norm - STANDING_ACTION_NORM) ** 2))
+                action_guide_bonus = W_POST_ACTION_GUIDE * math.exp(-2.0 * action_dist)
                 reward += (W_POST_STAND * uprightness_now * height_ratio  # v67: 相乘，高度门控
                          + W_POST_HEIGHT * height_ratio
                          + W_POST_FEET * feet_ratio
-                         + W_POST_GUIDE * post_guide)
+                         + W_POST_GUIDE * post_guide
+                         + height_vel_bonus            # v82: 高度速度奖励
+                         + stand_guide_bonus           # v83: 关节角空间引导（v85=0）
+                         + action_guide_bonus)         # v85: 动作空间站立引导（核心新项！）
                 self._post_success_steps += 1
 
         # ── 终止判断 ──────────────────────────────────────────────────────
@@ -761,27 +860,34 @@ class BittleBackflipEnv(gym.Env):
                               physicsClientId=self.physics_client)
 
     def _prone_rsi_init(self):
-        """趴地RSI（v66新增）：从后空翻落地后的典型趴地姿态开始。
+        """趴地RSI（v66新增，v72重大修复）：从真实后空翻落地后状态开始。
 
-        模拟机器人后空翻落地后趴在地上的状态：
-          - body height ≈ 0.04-0.06m（贴地）
-          - pitch ≈ 0（body近乎水平，与正常站立类似但高度极低）
-          - joint angles ≈ 帧3（落地准备帧）+ 随机扰动（覆盖不同趴地姿态）
+        v72 修复：使用实测后空翻落地关节角（diagnose_landing.py 诊断）：
+          - 实际落地高度 ≈ 0.022-0.025m（不是之前的 0.04-0.06m！）
+          - 实际落地关节 ≈ [73°,-72°, 73°,-72°, 109°,-73°, 110°,-73°]
+            （不是 BF_FRAMES_RAD[3]=[54°,-44°,54°,-44°,82°,-50°,82°,-50°]！）
+          - pitch ≈ 0°（body水平，右侧朝上，完成360°后空翻后正常朝向）
 
-        目的：让agent在训练中直接面对"需要从趴地站起来"的场景，
-        而不是每次都从地面起跳做后空翻。20%的episode用这个初始化，
-        专门训练起身运动序列，其余80%仍练完整后空翻。
+        v66-v71 的根本错误：RSI初始化用 BF_FRAMES_RAD[3]（落地准备帧），
+          而实际落地状态关节角差了20-30°，导致训练和评估分布不匹配（distribution shift）。
+          训练学到的起身技能无法迁移到真实落地状态——这就是7个版本都是0.0226m的根本原因。
 
+        目的：让agent在真实落地状态下练习起身，确保训练-评估分布一致。
         仅设置 PyBullet 物理状态；Python 状态变量由 reset() 的"RSI后处理"统一设置。
         """
-        height = float(np.random.uniform(0.04, 0.06))   # 0.04-0.06m：贴地趴着的真实高度范围
+        # v72：真实落地高度范围（实测0.0225m，加随机扰动覆盖不同落地变体）
+        height = float(np.random.uniform(0.020, 0.030))
         p.resetBasePositionAndOrientation(
             self.robot_id, [0, 0, height],
-            p.getQuaternionFromEuler([0, 0, 0]),
+            p.getQuaternionFromEuler([np.random.uniform(-0.05, 0.05),  # 小pitch扰动
+                                      np.random.uniform(-0.05, 0.05),  # 小roll扰动
+                                      0]),
             physicsClientId=self.physics_client,
         )
-        # 关节角设为帧3（伸腿准备落地）+ 轻微随机扰动，覆盖不同趴地姿态
-        landing_joints = BF_FRAMES_RAD[3] + np.random.uniform(-0.3, 0.3, 8)
+        # v72：真实落地关节配置（实测值）+ 较大随机扰动覆盖状态空间
+        # 实测: [72.8°,-71.9°, 72.6°,-71.6°, 108.5°,-73.0°, 109.6°,-73.0°]
+        ACTUAL_LANDING_RAD = np.deg2rad([73.0, -72.0, 73.0, -72.0, 109.0, -73.0, 110.0, -73.0])
+        landing_joints = ACTUAL_LANDING_RAD + np.random.uniform(-0.5, 0.5, 8)  # ±30°扰动
         for i, jid in enumerate(self.joint_id[:8]):
             p.resetJointState(self.robot_id, jid, landing_joints[i],
                               physicsClientId=self.physics_client)
@@ -796,8 +902,57 @@ class BittleBackflipEnv(gym.Env):
         for _ in range(5):
             p.stepSimulation(physicsClientId=self.physics_client)
 
+    def _near_stand_rsi_init(self):
+        """近站姿 RSI（v84 新增）：从接近站立的位置开始练习。
+
+        核心作用：填补 Critic 在 lying(0.022m) → standing(0.09m) 路径上的价值函数空白。
+
+        问题根因（V80-V83 失败）：
+          Critic 只见过两种状态：
+            1. 趴地状态（0.022m）→ 价值=中等（W_POST_HEIGHT×0.14×400步）
+            2. 理论站立状态（0.09m）→ 从未见过！价值=未知
+          Critic 无法在 0.022m~0.09m 区间提供有效梯度。
+          Actor 的探索无法超越 Critic 的价值函数盲区。
+
+        解法（V84）：
+          近站姿 RSI 给 Critic 直接训练数据：
+            h=0.07-0.09m + joints≈[50°,0°,...] → 高奖励（W_POST_HEIGHT×0.89×400步=178万分）
+          Critic 学会：h越高→价值越大（连续梯度！）
+          Actor 随即跟随：lying(低价值) → 任何上升动作 → 更高价值
+
+        仅设置 PyBullet 物理状态；Python 状态变量由 reset() 的"RSI后处理"统一设置。
+        """
+        # 接近站立的关节角：站立目标 ±15°（~0.26rad）随机扰动，覆盖更大状态空间
+        init_rad = np.deg2rad([50, 0, 50, 0, 50, 0, 50, 0])
+        near_stand_joints = init_rad + np.random.uniform(-0.26, 0.26, 8)  # ±15°
+        near_stand_joints = np.clip(near_stand_joints, -self._bound_ang, self._bound_ang)
+
+        # body 高度：0.07-0.09m（站立自然高度附近），经过物理步骤会自然落到脚支撑高度
+        start_h = float(np.random.uniform(0.07, 0.10))
+        p.resetBasePositionAndOrientation(
+            self.robot_id, [0, 0, start_h],
+            p.getQuaternionFromEuler([
+                np.random.uniform(-0.1, 0.1),   # pitch：±6° 小扰动（接近直立）
+                np.random.uniform(-0.1, 0.1),   # roll：±6° 小扰动
+                0,
+            ]),
+            physicsClientId=self.physics_client,
+        )
+        for i, jid in enumerate(self.joint_id[:8]):
+            p.resetJointState(self.robot_id, jid, near_stand_joints[i],
+                              physicsClientId=self.physics_client)
+        p.resetBaseVelocity(
+            self.robot_id,
+            linearVelocity=[0, 0, 0],
+            angularVelocity=[0, 0, 0],
+            physicsClientId=self.physics_client,
+        )
+        # 让物理稳定（机器人从 start_h 落地到自然支撑高度）
+        for _ in range(10):
+            p.stepSimulation(physicsClientId=self.physics_client)
+
     def _get_obs(self) -> np.ndarray:
-        """构建 23 维观测向量。"""
+        """构建 24 维观测向量（v80新增 success_flag）。"""
         pos, orn = p.getBasePositionAndOrientation(
             self.robot_id, physicsClientId=self.physics_client
         )
@@ -821,6 +976,7 @@ class BittleBackflipEnv(gym.Env):
             np.array([pos[2]], dtype=np.float32),     # [10]   高度
             joint_angs_norm.astype(np.float32),       # [11:19] 关节角
             contact_feet,                              # [19:23] 触地状态
+            np.array([float(self._success)], dtype=np.float32),  # [23] v80: success_flag（0=翻转中，1=站立阶段）
         ])
 
     def _discover_paw_links(self) -> list[int]:

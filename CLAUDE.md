@@ -482,6 +482,87 @@ W_ERROR_DELTA     = 1.0           # 误差变化率奖励（继承自万向行�
 
 ---
 
+## 人形后空翻训练复盘（2026-03-08~15，已停止）
+
+### 项目结论
+**目标**：人形机器人完成后空翻（rotation≥286°，rot@land≈360°）
+**最终结果**：rotation=190°（v2，模型已丢失）→ 项目停止
+**停止原因**：v2 之后 NaN 崩溃+模型管理失败，无法从 190° 推进到 286°+
+
+---
+
+### 版本进化完整记录
+
+| 版本 | rotation | 关键改动 | 结果 | 备注 |
+|------|----------|---------|------|------|
+| v1 | 136° | 从 humanoid_sac 热启（376→382维），W_ROTATION=20 | ⚠️ 地面滚动 gaming | 落地后继续在地上滚计旋转分 |
+| **v2** | **190°** | W_ROTATION=5→**5**，W_ROT_STEP=8→**20**，W_MILESTONE=3×W_ROT→**30** | ✅ 突破！ | 历史最高，模型后来被覆盖丢失 |
+| v3 | NaN崩溃 | W_MILESTONE=150（绝对值） | ❌ 180K步NaN | |
+| v3b | NaN崩溃 | W_MILESTONE=80 | ❌ 150K步NaN | |
+| v3c | NaN崩溃 | lr=2e-4，tau=0.002，log_std_init=-2.0，W_MILESTONE=80 | ❌ 220K步NaN | 调参无效 |
+| v3d | 101° | 重置 log_std + critic | ❌ 大幅退步 | Critic重置导致灾难性遗忘 |
+| v4 | 103° | 仅重置 log_std（修正） | ❌ 仍退步 | v2 模型已被v3系列覆盖，无法恢复 |
+| v5 | ep_len=18 | 从 humanoid_sac 冷启，W_ROTATION=5 | ❌ 立即倒地gaming | W_ROTATION=5 冷启动信号太弱 |
+| v6 | 未知 | 从 humanoid_sac 冷启，W_ROTATION=20（v1原参） | 🛑 用户叫停 | — |
+
+---
+
+### NaN崩溃根因：SDE log_std 坍塌
+
+**问题**：v2 经过 5M+ 步训练后，SAC actor 的 `log_std` 参数（控制动作探索幅度）收缩到近零（std≈0.003）。此时用修改后的奖励函数热启动，梯度爆炸 → NaN。
+
+**表现**：
+```
+ValueError: Expected parameter scale (Tensor ...) to satisfy GreaterThan(lower_bound=0.0),
+but found NaN
+```
+
+**无效修复尝试**：降低 lr（2e-4）、降低 tau（0.002）、调整 log_std_init（-2.0）—— 都无效，因为根因是**已保存模型的 log_std 权重本身就坏了**。
+
+**正确修复**（v4）：热启动时只跳过 `log_std`，其他权重完整复制：
+```python
+for k in new_sd:
+    if k in loaded_sd and new_sd[k].shape == loaded_sd[k].shape:
+        if "log_std" in k:
+            continue   # 只跳过 log_std，保留 critic
+        new_sd[k] = loaded_sd[k].clone()
+```
+
+**代价**：才发现正确修复时，v2 的 190° 模型已被 v3/v4 实验覆盖，无法恢复。
+
+---
+
+### 模型管理失败（血泪教训）
+
+v2 达到 190° 后，后续每次实验都直接覆盖了 `trained/humanoid_backflip/best.zip`，没有备份。
+
+损失：
+- v2 best.zip（rotation=190°）→ 被 v3 覆盖
+- v3 的 checkpoints → 崩溃，无效
+- v3d 覆盖后只剩 101° 模型
+
+**规律十（新增）：每次奖励参数调整前，必须先备份当前最优模型**
+```bash
+# 每次实验前的必做操作
+cp trained/humanoid_backflip/best.zip trained/humanoid_backflip/best_v2_backup.zip
+```
+万向行走项目做对了这件事（`best_v6_backup.zip`），后空翻没做，代价惨重。
+
+---
+
+### 未解决的核心问题
+
+人形后空翻在 190° 卡墙，根因与四足 V41 阶段（332°）相同：**per-step 连续旋转奖励形成舒适区**，agent 宁可稳定收 W_ROTATION×0.6/步，也不愿冒险翻得更多。
+
+预期解法（参考四足 V42-V54 路线）：
+1. 引入 `W_ROT_COMPLETENESS`（旋转完整度奖励，基线贴近当前稳定点 190°→286°）
+2. 搜索 ent_coef 甜蜜点（先试 0.005，再试 0.007）
+3. 必须先从 humanoid_sac 冷启积累到稳定 190°+，再尝试突破
+
+但项目在此之前已停止。
+
+---
+
 ## 血泪教训（11 Bug 复盘）
 
 ### 致命级（必须牢记）

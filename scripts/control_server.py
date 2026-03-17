@@ -38,6 +38,8 @@ DEFAULT_STEPS = 5
 MAX_STEPS = 60        # MoE 模式最多 60步（env 约 251 步后自然终止）
 MAX_TOTAL_FRAMES = 60 # 固件关键帧 GIF 最大帧数（MoE 不受此限制）
 
+TRAINED_ROOT = Path(__file__).parent.parent / "trained"
+
 GIF_W, GIF_H = 480, 360
 
 # 初始站姿（度），用于 POSTURE 插值起点，也是 URDF 坐标系的站立参考
@@ -474,11 +476,134 @@ def _simulate_rl_to_gif(steps: int, model_type: str = "best", target_name: str =
 
 
 # ---------------------------------------------------------------------------
+# 公共帧→GIF 辅助（backflip_rl / humanoid 共用）
+# ---------------------------------------------------------------------------
+def _frames_to_gif(frames: list, caption: str = "", fps: int = 15) -> bytes:
+    """把 RGB numpy 帧列表加水印后编码为 GIF 字节。"""
+    pil_frames = []
+    for f in frames:
+        img = Image.fromarray(f)
+        draw = ImageDraw.Draw(img)
+        draw.text(
+            (img.width - 8, img.height - 8),
+            caption,
+            fill=(255, 255, 255),
+            stroke_fill=(0, 0, 0),
+            stroke_width=2,
+            anchor="rb",
+        )
+        pil_frames.append(np.array(img))
+    buf = io.BytesIO()
+    imageio.mimsave(buf, pil_frames, format="GIF", fps=fps, loop=0)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# RL 后空翻仿真（backflip_v89/v90/v64）
+# ---------------------------------------------------------------------------
+def _simulate_backflip_to_gif(steps: int = 150) -> bytes:
+    """加载最佳后空翻 RL 模型，仿真并返回 GIF 字节。"""
+    from stable_baselines3 import PPO
+    from jprobot.training.env_backflip import BittleBackflipEnv
+
+    # 按优先级查找可用模型（v89 = confirmed demo model）
+    ver_found = None
+    for ver in ["backflip_v89", "backflip_v90", "backflip_v64"]:
+        model_path = TRAINED_ROOT / ver / "full" / "best.zip"
+        if model_path.exists():
+            ver_found = ver
+            break
+
+    if ver_found is None:
+        raise FileNotFoundError("找不到任何 backflip RL 模型（v89/v90/v64）")
+
+    print(f"[backflip_rl] 加载模型: {ver_found}/full/best.zip")
+    model = PPO.load(str(TRAINED_ROOT / ver_found / "full" / "best.zip"))
+    env = BittleBackflipEnv(render_mode="rgb_array", training_phase="full",
+                            disable_rsi=True)
+    try:
+        obs, _ = env.reset()
+        frames = []
+        for _ in range(steps):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, terminated, truncated, _ = env.step(action)
+            frame = env.render()
+            if frame is not None:
+                frames.append(frame)
+            if terminated or truncated:
+                break
+    finally:
+        env.close()
+
+    caption = f"JPRobot RL Backflip ({ver_found})"
+    return _frames_to_gif(frames, caption=caption, fps=15)
+
+
+# ---------------------------------------------------------------------------
+# 人形机器人方向解析 + 仿真
+# ---------------------------------------------------------------------------
+def _parse_humanoid_direction(text: str) -> tuple:
+    """从自然语言解析 (vx, vy, wz)。"""
+    if any(kw in text for kw in ["向左走", "左移", "侧左"]):   return  0.3,  0.4, 0.0
+    if any(kw in text for kw in ["向右走", "右移", "侧右"]):   return  0.3, -0.4, 0.0
+    if any(kw in text for kw in ["后退", "向后走", "倒退"]):   return -0.5,  0.0, 0.0
+    if any(kw in text for kw in ["左转", "向左转"]):            return  0.3,  0.0, 0.6
+    if any(kw in text for kw in ["右转", "向右转"]):            return  0.3,  0.0,-0.6
+    return 0.8, 0.0, 0.0  # 默认：向前走
+
+
+def _humanoid_dir_label(vx: float, vy: float, wz: float) -> str:
+    if wz > 0.1:   return "左转"
+    if wz < -0.1:  return "右转"
+    if vx < 0:     return "后退"
+    if vy > 0.1:   return "左移"
+    if vy < -0.1:  return "右移"
+    return "前进"
+
+
+def _simulate_humanoid_to_gif(vx: float = 0.8, vy: float = 0.0, wz: float = 0.0,
+                               steps: int = 100, mode: str = "walk") -> bytes:
+    """在独立子进程中运行人形仿真并返回 GIF 字节。
+
+    macOS 上 MuJoCo rgb_array 渲染需要主线程（OpenGL/Metal 限制），
+    HTTP server 的 worker 线程中会卡死。通过 subprocess 绕过此限制：
+    子进程是独立主线程，可正常调用 env.render()。
+
+    mode: "walk"（默认，万向行走模型）| "run"（跑步模型，高速+腾空相）
+    """
+    import subprocess
+    worker = Path(__file__).parent / "humanoid_sim_worker.py"
+    print(f"[humanoid] 启动子进程仿真  vx={vx} vy={vy} wz={wz} steps={steps} mode={mode}")
+    result = subprocess.run(
+        [sys.executable, str(worker), str(vx), str(vy), str(wz), str(steps), mode],
+        capture_output=True,
+        timeout=120,
+        cwd=str(Path(__file__).parent.parent),
+    )
+    if result.returncode != 0:
+        err = result.stderr.decode(errors="replace")
+        raise RuntimeError(f"humanoid worker 失败: {err[-500:]}")
+    return result.stdout
+
+
+# ---------------------------------------------------------------------------
 # 仿真 & GIF 渲染
 # ---------------------------------------------------------------------------
 def simulate_to_gif(command: str) -> bytes:
     """运行 PyBullet DIRECT 仿真，返回 GIF 二进制。"""
     with SIM_LOCK:
+        # ── 人形机器人路由（优先检测，避免被步态解析器截获）──────────────────
+        if any(kw in command for kw in ["人形", "人型", "humanoid"]):
+            # 跑步：专用高速模型（腾空相，vx=1.5m/s）
+            if any(kw in command for kw in ["跑步", "奔跑", "跑起来", "快跑", "跑", "run"]):
+                return _simulate_humanoid_to_gif(1.5, 0.0, 0.0, mode="run")
+            vx, vy, wz = _parse_humanoid_direction(command)
+            return _simulate_humanoid_to_gif(vx, vy, wz)
+
+        # ── RL 后空翻路由（区别于固件 bf）────────────────────────────────────
+        if any(kw in command for kw in ["强化后空翻", "RL后空翻", "强化翻", "rl后空翻"]):
+            return _simulate_backflip_to_gif()
+
         skill_code, steps, model_type = parse_command(command)
 
         # MoE / RL 策略走单独渲染路径

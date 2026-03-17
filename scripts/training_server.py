@@ -197,6 +197,8 @@ class EvalEngine:
             return os.path.join(base, "humanoid_velocity", "best.zip")
         if model_name == "__humanoid_run__":
             return os.path.join(base, "humanoid_run", "best.zip")
+        if model_name == "__humanoid_backflip__":
+            return os.path.join(base, "humanoid_backflip", "best.zip")
         if model_name == "__humanoid_upright_c2__":
             return os.path.join(base, "humanoid_upright", "C2", "best.zip")
         sac_ckpt_m = re.match(r'^__humanoid_sac_ckpt_(\d+)__$', model_name)
@@ -237,6 +239,10 @@ class EvalEngine:
 
         if self.current_model == "__humanoid_run__":
             self._run_loop_humanoid_run()
+            return
+
+        if self.current_model == "__humanoid_backflip__":
+            self._run_loop_humanoid_backflip()
             return
 
         if self.current_model == "__humanoid_upright_c2__":
@@ -1041,6 +1047,126 @@ class EvalEngine:
             self._broadcast("status", {"state": "stopped"})
 
 
+    def _run_loop_humanoid_backflip(self):
+        """后空翻人形机器人可视化：HumanoidBackflipEnv + SAC 策略。
+
+        专用 HUD 指标：
+          - rotation_deg:  向后累积旋转度数（腾空时积分，目标 360°）
+          - rot_at_land:   落地瞬间的旋转度数（核心指标，目标 360°）
+          - success:       后空翻成功标志（rotation≥286°且落地）
+          - airborne:      当前是否腾空
+        """
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        from stable_baselines3 import SAC
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from jprobot.training.env_humanoid_backflip import HumanoidBackflipEnv
+
+        base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained"))
+        model_path = os.path.join(base, "humanoid_backflip", "best.zip")
+
+        if not self._is_readable_zip(model_path):
+            self._broadcast("status", {"state": "error", "message": f"Model not found: {model_path}"})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "loading"
+        self._broadcast("status", {"state": "loading", "model": "__humanoid_backflip__"})
+
+        try:
+            env = HumanoidBackflipEnv()
+            model = SAC.load(model_path)
+        except Exception as e:
+            self._broadcast("status", {"state": "error", "message": str(e)})
+            self.running = False
+            self.state = "idle"
+            return
+
+        self.state = "running"
+        self._broadcast("status", {"state": "running", "model": "__humanoid_backflip__"})
+
+        last_mtime = os.path.getmtime(model_path)
+        episode = 0
+
+        try:
+            while self.running:
+                episode += 1
+                obs, info = env.reset()
+                total_reward = 0.0
+                rot_at_land = 0.0
+
+                self._broadcast("episode_start", {"episode": episode})
+
+                step = 0
+                while self.running:
+                    action, _ = model.predict(obs, deterministic=True)
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    step += 1
+                    total_reward += float(reward)
+
+                    if info.get("just_landed", False):
+                        rot_at_land = float(info.get("backward_rot_deg", 0.0))
+
+                    pos = env.unwrapped.data.qpos[:3].tolist()
+                    orn_mj = env.unwrapped.data.qpos[3:7]
+                    orn_xyzw = [float(orn_mj[1]), float(orn_mj[2]),
+                                float(orn_mj[3]), float(orn_mj[0])]
+                    joints = [round(float(v), 4) for v in env.unwrapped.data.qpos[7:]]
+
+                    self._broadcast("frame", {
+                        "step": step,
+                        "position": [round(v, 5) for v in pos],
+                        "orientation": [round(v, 5) for v in orn_xyzw],
+                        "joints": joints,
+                        "reward": round(float(reward), 2),
+                        "robot_type": "humanoid",
+                        "rotation_deg": round(float(info.get("backward_rot_deg", 0.0)), 1),
+                        "rot_at_land": round(rot_at_land, 1),
+                        "success": bool(info.get("success", False)),
+                        "airborne": bool(info.get("airborne", False)),
+                        "torso_z": round(float(info.get("torso_z", 0.0)), 3),
+                    })
+
+                    time.sleep(0.02)
+
+                    if terminated or truncated:
+                        break
+
+                self._broadcast("episode_end", {
+                    "episode": episode,
+                    "total_reward": round(total_reward, 2),
+                    "steps": step,
+                    "survived": not terminated,
+                    "max_distance": 0.0,
+                    "rotation_deg": round(float(info.get("backward_rot_deg", 0.0)), 1),
+                    "rot_at_land": round(rot_at_land, 1),
+                    "success": bool(info.get("success", False)),
+                })
+
+                try:
+                    cur_mtime = os.path.getmtime(model_path)
+                    if cur_mtime != last_mtime:
+                        last_mtime = cur_mtime
+                        model = SAC.load(model_path)
+                        self._broadcast("model_updated", {
+                            "file": "humanoid_backflip/best.zip",
+                            "mtime": cur_mtime,
+                        })
+                except Exception as e:
+                    self._broadcast("status", {"state": "error", "message": str(e)})
+                    break
+
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+            self.state = "idle"
+            self.running = False
+            self._broadcast("status", {"state": "stopped"})
+
+
 # Global eval engine instance (created in main)
 eval_engine = None
 
@@ -1337,6 +1463,11 @@ VISUALIZATION_HTML = r"""<!DOCTYPE html>
     <div><span class="label">Cmd: </span><span class="val" id="sVelCmd" style="color:#a78bfa;">-</span></div>
     <div><span class="label">Vel: </span><span class="val" id="sVelActual" style="color:#34d399;">-</span></div>
     <div><span class="label">Err: </span><span class="val" id="sVelError" style="color:#fb923c;">-</span></div>
+  </div>
+  <div id="sBackflipRow" style="display:none;">
+    <div><span class="label">Rot: </span><span class="val" id="sRotDeg" style="color:#f472b6;">-</span></div>
+    <div><span class="label">@Land: </span><span class="val" id="sRotAtLand" style="color:#fb923c;">-</span></div>
+    <div><span class="label">Status: </span><span class="val" id="sBackflipStatus" style="color:#4ade80;">-</span></div>
   </div>
 </div>
 
@@ -2191,6 +2322,19 @@ function connectSSE() {
     } else {
       velRow.style.display = 'none';
     }
+
+    // 后空翻 HUD（仅后空翻模式显示）
+    const backflipRow = document.getElementById('sBackflipRow');
+    if (d.rotation_deg !== undefined) {
+      backflipRow.style.display = '';
+      document.getElementById('sRotDeg').textContent = d.rotation_deg.toFixed(1) + '°';
+      const rotLand = (d.rot_at_land !== undefined && d.rot_at_land > 0) ? d.rot_at_land : 0;
+      document.getElementById('sRotAtLand').textContent = rotLand > 0 ? rotLand.toFixed(1) + '°' : '-';
+      const bfStatus = d.success ? '✅ 成功' : (d.airborne ? '🌀 旋转中' : '⬆️ 准备起跳');
+      document.getElementById('sBackflipStatus').textContent = bfStatus;
+    } else {
+      backflipRow.style.display = 'none';
+    }
   });
 
   evtSource.addEventListener('episode_end', e => {
@@ -2343,6 +2487,7 @@ fetch('/api/viz/snapshots')
         : name === '__humanoid_upright_c2__'               ? '🧍 Humanoid 直立 C2（软奖励直立版）'
         : name === '__humanoid_velocity__'                 ? '🏃 Humanoid 万向行走（速度命令跟随）'
         : name === '__humanoid_run__'                      ? '🦅 Humanoid 跑步（腾空步态 22%）'
+        : name === '__humanoid_backflip__'                 ? '🤸 Humanoid 后空翻（后空翻训练）'
         : name === '__humanoid_sac__'                      ? '🚶 Humanoid SAC — best（弯腰基线版）'
         : name === '__backflip_latest__'                   ? '🤸 Backflip — best（最新最佳）'
         : sacCkptMatch ? `🚶 Humanoid SAC — ${(parseInt(sacCkptMatch[1])/1e6).toFixed(1)}M 步快照`
@@ -2437,6 +2582,11 @@ def _list_snapshots(trained_dir):
     run_best = os.path.join(base, "humanoid_run", "best.zip")
     if os.path.exists(run_best):
         snapshots.append("__humanoid_run__")
+
+    # 后空翻版（382维obs）
+    backflip_best = os.path.join(base, "humanoid_backflip", "best.zip")
+    if os.path.exists(backflip_best):
+        snapshots.append("__humanoid_backflip__")
 
     sac_best = os.path.join(base, "humanoid_sac", "best.zip")
     if os.path.exists(sac_best):
